@@ -1,25 +1,53 @@
 import { useEffect, useState } from "react";
+import { API_BASE_URL } from "../api/client";
 import { VISUAL_SOURCES } from "../visuals";
 
 interface ProductVisualProps {
   imageUrl: string | null;
   tag: string;
   visualKey?: string | null;
-  ean?: string | null;
   productName: string | null;
   size?: "card" | "hit";
 }
 
+// In-memory within this tab's lifetime: avoids duplicate network calls for
+// the same product appearing in both OfferList and TopHits at once.
 const imageCache = new Map<string, Promise<string | null>>();
-const requestCooldown = new Map<string, number>();
+
+// Backed by sessionStorage so a page reload doesn't forget we were just
+// rate-limited and immediately re-fire the same request. This is a client-side
+// safety net; the real fix is the backend's own short-lived failure cache in
+// image_cache.py, which is shared across all users/tabs. This just keeps a
+// single tab from re-asking for what it already knows was recently refused.
+const COOLDOWN_STORAGE_KEY = "muj-akcni-letak:image-cooldowns";
+const COOLDOWN_MS = 15000;
+
+function readCooldowns(): Record<string, number> {
+  try {
+    return JSON.parse(sessionStorage.getItem(COOLDOWN_STORAGE_KEY) ?? "{}");
+  } catch {
+    return {};
+  }
+}
 
 function canRequestAgain(cacheKey: string) {
+  const cooldowns = readCooldowns();
   const now = Date.now();
-  const lastRequest = requestCooldown.get(cacheKey) ?? 0;
-  if (now - lastRequest < 15000) {
+  const lastRequest = cooldowns[cacheKey] ?? 0;
+  if (now - lastRequest < COOLDOWN_MS) {
     return false;
   }
-  requestCooldown.set(cacheKey, now);
+  cooldowns[cacheKey] = now;
+  // Trim old entries so this doesn't grow unbounded over a long session.
+  for (const key of Object.keys(cooldowns)) {
+    if (now - cooldowns[key] > COOLDOWN_MS * 10) delete cooldowns[key];
+  }
+  try {
+    sessionStorage.setItem(COOLDOWN_STORAGE_KEY, JSON.stringify(cooldowns));
+  } catch {
+    // sessionStorage full or unavailable (e.g. private mode) - degrade to
+    // "always allow", which just means we lose the cross-reload cooldown.
+  }
   return true;
 }
 
@@ -53,58 +81,6 @@ function Placeholder({ label, sizeClass }: { label: string; sizeClass: string })
   );
 }
 
-async function fetchProductImageByEan(ean: string | null | undefined, fallbackUrl: string | null) {
-  if (isValidImageUrl(fallbackUrl)) {
-    return fallbackUrl;
-  }
-
-  const normalizedEan = normalizeQuery(ean);
-  if (!normalizedEan || normalizedEan.length < 8) {
-    return null;
-  }
-
-  const cacheKey = `ean:${normalizedEan}`;
-  if (imageCache.has(cacheKey)) {
-    return imageCache.get(cacheKey)!;
-  }
-
-  const request = (async () => {
-    try {
-      // ⏱ Rozprostření dotazů až na 5 vteřin
-      await new Promise((resolve) => setTimeout(resolve, Math.random() * 5000));
-      
-      const response = await fetch(`http://localhost:8000/api/proxy-image?code=${encodeURIComponent(normalizedEan)}`);
-
-      if (!response.ok) {
-        if (response.status === 429) {
-          console.error("❌ API nás zablokovalo (Rate Limit) pro EAN:", normalizedEan);
-        }
-        return null;
-      }
-
-      const contentType = response.headers.get("content-type") ?? "";
-      const rawText = await response.text();
-      if (!rawText || !contentType.includes("application/json")) {
-        return null;
-      }
-
-      // Podpora obou formátů (camelCase i snake_case) pro jistotu
-      const data = JSON.parse(rawText) as { image_url?: string | null; imageUrl?: string | null };
-      return data.imageUrl ?? data.image_url ?? null;
-    } catch {
-      return null;
-    }
-  })();
-
-  imageCache.set(cacheKey, request);
-
-  request.then((res) => {
-    if (!res) imageCache.delete(cacheKey);
-  }).catch(() => imageCache.delete(cacheKey));
-
-  return request;
-}
-
 async function fetchProductImageByName(productName: string | null, fallbackUrl: string | null) {
   if (isValidImageUrl(fallbackUrl)) {
     return fallbackUrl;
@@ -126,10 +102,7 @@ async function fetchProductImageByName(productName: string | null, fallbackUrl: 
 
   const request = (async () => {
     try {
-      // ⏱ Rozprostření dotazů až na 5 vteřin
-      await new Promise((resolve) => setTimeout(resolve, Math.random() * 5000));
-
-      const response = await fetch(`http://localhost:8000/api/proxy-image?query=${encodeURIComponent(query)}`);
+      const response = await fetch(`${API_BASE_URL}/api/proxy-image?query=${encodeURIComponent(query)}`);
 
       if (!response.ok) {
         if (response.status === 429) {
@@ -138,7 +111,6 @@ async function fetchProductImageByName(productName: string | null, fallbackUrl: 
         return null;
       }
 
-      // Podpora obou formátů (camelCase i snake_case) pro jistotu
       const data = (await response.json()) as { image_url?: string | null; imageUrl?: string | null };
       return data.imageUrl ?? data.image_url ?? null;
     } catch (error) {
@@ -149,14 +121,17 @@ async function fetchProductImageByName(productName: string | null, fallbackUrl: 
 
   imageCache.set(cacheKey, request);
 
-  request.then((res) => {
-    if (!res) imageCache.delete(cacheKey);
-  }).catch(() => imageCache.delete(cacheKey));
+  // On a null result we deliberately do NOT delete the cache entry anymore:
+  // the backend now remembers "miss"/"failure" outcomes itself (with its own
+  // TTLs), so re-fetching on every re-render here would defeat that and just
+  // recreate the original problem. The per-tab cooldown above already gates
+  // retries; letting this promise cache stand means we won't even ask again
+  // within the same tab until a fresh mount needs it.
 
   return request;
 }
 
-export function ProductVisual({ imageUrl, tag, visualKey, ean, productName, size = "card" }: ProductVisualProps) {
+export function ProductVisual({ imageUrl, tag, visualKey, productName, size = "card" }: ProductVisualProps) {
   const [resolvedImage, setResolvedImage] = useState<string | null>(imageUrl ?? null);
   const [imageFailed, setImageFailed] = useState(false);
   const [isFetching, setIsFetching] = useState(!isValidImageUrl(imageUrl));
@@ -179,7 +154,7 @@ export function ProductVisual({ imageUrl, tag, visualKey, ean, productName, size
     const sourceName = resolveImageQuery(productName, tag, visualKey);
 
     void (async () => {
-      const image = (await fetchProductImageByEan(ean, nextImage)) ?? (await fetchProductImageByName(sourceName, nextImage));
+      const image = await fetchProductImageByName(sourceName, nextImage);
 
       if (!isActive) {
         return;
@@ -192,7 +167,7 @@ export function ProductVisual({ imageUrl, tag, visualKey, ean, productName, size
     return () => {
       isActive = false;
     };
-  }, [ean, imageUrl, productName, tag, visualKey]);
+  }, [imageUrl, productName, tag, visualKey]);
 
   if (isFetching || !resolvedImage || imageFailed) {
     const placeholderLabel = (productName ?? tag ?? lookupVisualQuery(visualKey) ?? "foto").slice(0, 12);

@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -5,12 +6,12 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import TypeAdapter, ValidationError
 
 from .config import MAX_TRACKED_ITEMS, STORES
-from .image_cache import get_cached_image_url, store_cached_image_url
+from .image_cache import get_cache_entry, store_cached_image_url
 from .kupi_service import build_store_summaries, build_top_hits, get_offers_for_rules, get_product_suggestions
 from .schemas import Offer, OffersResponse, StoreOut, StoreSummary, TrackingRule
-from pydantic import TypeAdapter, ValidationError
 
 app = FastAPI(title="Muj akcni letak API")
 
@@ -22,6 +23,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Open Food Facts is a shared, free, rate-limited API. Firing 20+ parallel
+# lookups (one per tracked item x store) at it is what triggers 429s in the
+# first place. A small semaphore serializes-ish our outbound calls without
+# blocking the rest of the API (each /api/offers request still returns
+# immediately; only the image lookups queue up behind this).
+_OFF_CONCURRENCY = asyncio.Semaphore(2)
 
 
 @app.get("/api/health")
@@ -104,10 +112,13 @@ async def proxy_image(
     normalized_query = " ".join(query.split()) if query else None
     normalized_code = "".join(code.split()) if code else None
     cache_key = f"ean:{normalized_code}" if normalized_code else f"name:{(normalized_query or '').lower()}"
-    cached_image_url = get_cached_image_url(cache_key)
-    
-    if cached_image_url is not None:
-        return {"image_url": cached_image_url}
+
+    cached = get_cache_entry(cache_key)
+    if cached is not None:
+        # Covers all three outcomes: a real image, a confirmed miss, or a
+        # still-fresh "we got rate-limited, don't hammer OFF again yet".
+        # Only an *expired* failure/miss falls through to a real fetch.
+        return {"image_url": cached["image_url"]}
 
     if normalized_code:
         target_url = (
@@ -127,32 +138,48 @@ async def proxy_image(
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
-        async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
-            response = await client.get(target_url)
-            
-            # Pokud nás OFF zablokuje nebo spadne, prostě vrátíme null (aby React vykreslil placeholder)
-            if response.status_code in [429, 503, 502, 500]:
+        async with _OFF_CONCURRENCY:
+            async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
+                response = await client.get(target_url)
+
+            if response.status_code in (429, 503, 502, 500):
                 print(f"⚠️ Open Food Facts nestíhá (Status {response.status_code}) pro: {normalized_query or normalized_code}")
+                # Cache as a short-lived FAILURE, not a permanent miss - the
+                # next request for the same product after FAILURE_TTL_SECONDS
+                # will retry for real instead of repeating the same 429.
+                store_cached_image_url(cache_key, normalized_query or normalized_code or "", None, status="failure")
                 return {"image_url": None}
-                
+
             response.raise_for_status()
             payload = response.json()
-            
+
     except httpx.HTTPStatusError as exc:
         print(f"⚠️ Open Food Facts HTTP chyba {exc.response.status_code}")
+        store_cached_image_url(cache_key, normalized_query or normalized_code or "", None, status="failure")
         return {"image_url": None}
     except httpx.RequestError as exc:
         print(f"⚠️ Open Food Facts nedostupný: {exc}")
+        store_cached_image_url(cache_key, normalized_query or normalized_code or "", None, status="failure")
         return {"image_url": None}
     except Exception as exc:
         print(f"⚠️ Nečekaná chyba při získávání obrázku: {exc}")
+        store_cached_image_url(cache_key, normalized_query or normalized_code or "", None, status="failure")
         return {"image_url": None}
 
     products = payload.get("products") or []
     product = next((item for item in products if item.get("image_front_url") or item.get("image_url")), None)
     image_url = product.get("image_front_url") or product.get("image_url") if product else None
-    store_cached_image_url(cache_key, normalized_query or normalized_code or "", image_url)
-    
+
+    # A clean response with no matching image is a confirmed MISS - OFF
+    # genuinely doesn't have this product's photo. That's stable information,
+    # worth caching for a week, not something to re-ask on every page load.
+    store_cached_image_url(
+        cache_key,
+        normalized_query or normalized_code or "",
+        image_url,
+        status="found" if image_url else "miss",
+    )
+
     return {"image_url": image_url}
 
 

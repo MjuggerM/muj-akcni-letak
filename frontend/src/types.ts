@@ -17,15 +17,26 @@ export interface TrackingRule {
   visual_key: string | null;
 }
 
+// Mirrors backend/app/schemas.py::TrackedItem. Note the field is
+// `blacklist` here, not `excluded_terms` - those are two different
+// concepts that happen to hold the same values: TrackingRule.excluded_terms
+// is the user's *setting*, TrackedItem.blacklist is what the backend
+// actually applied to produce this specific offer.
+export interface TrackedItem {
+  keyword: string;
+  label?: string;
+  blacklist: string[];
+  temporary: boolean;
+}
+
 export interface Offer {
   product_name: string | null;
-  ean?: string | null;
   shop_raw: string;
   store_id: string | null;
   price: string | null;
   amount: string | null;
   validity: string | null;
-  tracked_item: { keyword: string; label?: string; excluded_terms: string[]; temporary: boolean } | string;
+  tracked_item: TrackedItem | string;
   tracking_rule_id: string | null;
   visual_key: string | null;
   image_url: string | null;

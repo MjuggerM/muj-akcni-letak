@@ -82,7 +82,7 @@ export function OfferList({ offers, storeSummaries, loading, error }: OfferListP
                     )}
 
                     <div className="flex items-start gap-3 pr-20">
-                      <ProductVisual imageUrl={offer.image_url} tag={trackedKey} visualKey={offer.visual_key} ean={offer.ean} productName={productName} size="hit" />
+                      <ProductVisual imageUrl={offer.image_url} tag={trackedKey} visualKey={offer.visual_key} productName={productName} size="hit" />
 
                       <div className="min-w-0 flex-1">
                         <p
