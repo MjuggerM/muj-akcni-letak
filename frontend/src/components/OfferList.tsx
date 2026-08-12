@@ -17,12 +17,6 @@ function EmptyState({ message }: { message: string }) {
   );
 }
 
-function isBestOffer(offer: Offer, groupOffers: Offer[]) {
-  return groupOffers
-    .filter((candidate) => candidate.unit_price != null)
-    .every((candidate) => candidate.unit_price === null || offer.unit_price === null || offer.unit_price <= candidate.unit_price);
-}
-
 export function OfferList({ offers, storeSummaries, loading, error }: OfferListProps) {
   if (loading) {
     return <EmptyState message="Načítám aktuální akce…" />;
@@ -73,12 +67,12 @@ export function OfferList({ offers, storeSummaries, loading, error }: OfferListP
             <div className="space-y-2">
               {group.offers.map((offer) => {
                 const trackedKey = typeof offer.tracked_item === "string" ? offer.tracked_item : offer.tracked_item?.label ?? offer.tracked_item?.keyword ?? "";
-                const isBest = isBestOffer(offer, group.offers);
+                const isBest = offer.is_best_deal && offer.unit_price != null;
                 const productName = offer.product_name ?? trackedKey ?? "Produkt";
 
                 return (
                   <article
-                    key={`${trackedKey}-${offer.shop_raw}-${productName}`}
+                    key={`${offer.tracking_rule_id ?? trackedKey}-${offer.store_id ?? offer.shop_raw}-${offer.visual_key ?? "novisual"}-${productName}-${offer.price ?? "noprice"}-${offer.amount ?? "noamount"}-${offer.validity ?? "novalid"}`}
                     className="relative rounded-xl bg-stone-900/80 p-3 transition-colors hover:bg-stone-900"
                   >
                     {isBest && (
@@ -88,7 +82,7 @@ export function OfferList({ offers, storeSummaries, loading, error }: OfferListP
                     )}
 
                     <div className="flex items-start gap-3 pr-20">
-                      <ProductVisual imageUrl={offer.image_url} tag={trackedKey} ean={offer.ean} productName={productName} size="hit" />
+                      <ProductVisual imageUrl={offer.image_url} tag={trackedKey} visualKey={offer.visual_key} ean={offer.ean} productName={productName} size="hit" />
 
                       <div className="min-w-0 flex-1">
                         <p

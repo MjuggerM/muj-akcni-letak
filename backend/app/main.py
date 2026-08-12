@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import MAX_TRACKED_ITEMS, STORES
+from .image_cache import get_cached_image_url, store_cached_image_url
 from .kupi_service import build_store_summaries, build_top_hits, get_offers_for_rules, get_product_suggestions
 from .schemas import Offer, OffersResponse, StoreOut, StoreSummary, TrackingRule
 from pydantic import TypeAdapter, ValidationError
@@ -96,12 +97,30 @@ async def product_suggestions(query: str = Query(..., min_length=2, max_length=8
 
 
 @app.get("/api/proxy-image")
-async def proxy_image(query: str = Query(..., min_length=2, max_length=120)) -> dict:
-    target_url = (
-        "https://world.openfoodfacts.org/cgi/search.pl"
-        f"?search_terms={query}&search_simple=1&action=process&json=1&page_size=1"
-        "&fields=product_name,image_front_url,image_url"
-    )
+async def proxy_image(
+    query: str | None = Query(None, min_length=2, max_length=120),
+    code: str | None = Query(None, min_length=8, max_length=32),
+) -> dict:
+    normalized_query = " ".join(query.split()) if query else None
+    normalized_code = "".join(code.split()) if code else None
+    cache_key = f"ean:{normalized_code}" if normalized_code else f"name:{(normalized_query or '').lower()}"
+    cached_image_url = get_cached_image_url(cache_key)
+    if cached_image_url is not None:
+        return {"image_url": cached_image_url}
+
+    if normalized_code:
+        target_url = (
+            "https://world.openfoodfacts.org/api/v2/search"
+            f"?code={normalized_code}&fields=product_name,image_front_url,image_url"
+        )
+    elif normalized_query:
+        target_url = (
+            "https://world.openfoodfacts.org/cgi/search.pl"
+            f"?search_terms={normalized_query}&search_simple=1&action=process&json=1&page_size=1"
+            "&fields=product_name,image_front_url,image_url"
+        )
+    else:
+        raise HTTPException(status_code=422, detail="Zadejte query nebo code.")
 
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -118,6 +137,7 @@ async def proxy_image(query: str = Query(..., min_length=2, max_length=120)) -> 
     products = payload.get("products") or []
     product = next((item for item in products if item.get("image_front_url") or item.get("image_url")), None)
     image_url = product.get("image_front_url") or product.get("image_url") if product else None
+    store_cached_image_url(cache_key, normalized_query or normalized_code or "", image_url)
     return {"image_url": image_url}
 
 

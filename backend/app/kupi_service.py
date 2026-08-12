@@ -121,17 +121,42 @@ def _image_url(product: dict) -> str | None:
     forward-compatible with an upgraded or locally extended scraper and lets
     the UI switch to real photos automatically once they are available.
     """
-    image = product.get("image_url") or product.get("image")
-    if not image:
-        images = product.get("image_urls") or product.get("images") or []
-        # A product picture belongs to the product, not to one of its shop
-        # rows, so all offers of that product share the first supplied image.
-        image = images[0] if isinstance(images, list) and images else None
-    if isinstance(image, dict):
-        image = image.get("url") or image.get("src")
-    if not isinstance(image, str) or not image:
+    candidate_keys = (
+        "image_front_url",
+        "image_url",
+        "image",
+        "image_src",
+        "src",
+        "data_src",
+        "data-src",
+        "thumbnail",
+        "thumbnail_url",
+    )
+
+    def extract(candidate: object) -> str | None:
+        if isinstance(candidate, str) and candidate:
+            return candidate
+        if isinstance(candidate, dict):
+            for nested_key in ("url", "src", "image", "image_url", "image_front_url", "data-src", "data_src"):
+                nested_value = candidate.get(nested_key)
+                if isinstance(nested_value, str) and nested_value:
+                    return nested_value
         return None
-    return f"https:{image}" if image.startswith("//") else image
+
+    for key in candidate_keys:
+        image = extract(product.get(key))
+        if image:
+            return f"https:{image}" if image.startswith("//") else image
+
+    for key in ("image_urls", "images", "image_list"):
+        images = product.get(key) or []
+        if isinstance(images, list):
+            for item in images:
+                image = extract(item)
+                if image:
+                    return f"https:{image}" if image.startswith("//") else image
+
+    return None
 
 
 def _flatten(raw_json: str, tracked_item: str) -> list[dict]:

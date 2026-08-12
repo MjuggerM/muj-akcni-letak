@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { VISUAL_SOURCES } from "../visuals";
 
 interface ProductVisualProps {
   imageUrl: string | null;
@@ -30,6 +31,29 @@ function normalizeQuery(value: string | null | undefined) {
   return (value ?? "").trim().replace(/\s+/g, " ");
 }
 
+function lookupVisualQuery(visualKey: string | null | undefined) {
+  if (!visualKey) {
+    return null;
+  }
+
+  return VISUAL_SOURCES[visualKey]?.remoteQuery ?? null;
+}
+
+function resolveImageQuery(productName: string | null, tag: string, visualKey: string | null | undefined) {
+  return normalizeQuery(productName) || normalizeQuery(tag) || lookupVisualQuery(visualKey) || null;
+}
+
+function Placeholder({ label, sizeClass }: { label: string; sizeClass: string }) {
+  return (
+    <div
+      aria-hidden="true"
+      className={`${sizeClass} flex shrink-0 items-center justify-center rounded-lg bg-stone-800 text-[10px] font-bold uppercase tracking-[0.18em] text-stone-400 ring-1 ring-stone-700`}
+    >
+      {label}
+    </div>
+  );
+}
+
 async function fetchProductImageByEan(ean: string | null | undefined, fallbackUrl: string | null) {
   if (isValidImageUrl(fallbackUrl)) {
     return fallbackUrl;
@@ -47,9 +71,7 @@ async function fetchProductImageByEan(ean: string | null | undefined, fallbackUr
 
   const request = (async () => {
     try {
-      const response = await fetch(
-        `https://world.openfoodfacts.org/api/v2/search?code=${encodeURIComponent(normalizedEan)}&fields=product_name,image_front_url,image_url`
-      );
+      const response = await fetch(`http://localhost:8000/api/proxy-image?code=${encodeURIComponent(normalizedEan)}`);
 
       if (!response.ok) {
         if (response.status === 429) {
@@ -64,12 +86,8 @@ async function fetchProductImageByEan(ean: string | null | undefined, fallbackUr
         return null;
       }
 
-      const data = JSON.parse(rawText) as {
-        products?: Array<{ image_front_url?: string | null; image_url?: string | null }>;
-      };
-
-      const product = data.products?.[0];
-      return product?.image_front_url ?? product?.image_url ?? null;
+      const data = JSON.parse(rawText) as { image_url?: string | null };
+      return data.image_url ?? null;
     } catch {
       return null;
     }
@@ -134,7 +152,6 @@ async function fetchProductImageByName(productName: string | null, fallbackUrl: 
 }
 
 export function ProductVisual({ imageUrl, tag, visualKey, ean, productName, size = "card" }: ProductVisualProps) {
-  void visualKey;
   const [resolvedImage, setResolvedImage] = useState<string | null>(imageUrl ?? null);
   const [imageFailed, setImageFailed] = useState(false);
   const [isFetching, setIsFetching] = useState(!isValidImageUrl(imageUrl));
@@ -154,7 +171,7 @@ export function ProductVisual({ imageUrl, tag, visualKey, ean, productName, size
       };
     }
 
-    const sourceName = productName ?? tag ?? null;
+    const sourceName = resolveImageQuery(productName, tag, visualKey);
 
     void (async () => {
       const image = (await fetchProductImageByEan(ean, nextImage)) ?? (await fetchProductImageByName(sourceName, nextImage));
@@ -170,10 +187,11 @@ export function ProductVisual({ imageUrl, tag, visualKey, ean, productName, size
     return () => {
       isActive = false;
     };
-  }, [imageUrl, productName, tag]);
+  }, [ean, imageUrl, productName, tag, visualKey]);
 
   if (isFetching || !resolvedImage || imageFailed) {
-    return null;
+    const placeholderLabel = (productName ?? tag ?? lookupVisualQuery(visualKey) ?? "foto").slice(0, 12);
+    return <Placeholder label={placeholderLabel} sizeClass={sizeClass} />;
   }
 
   return (

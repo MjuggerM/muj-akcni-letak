@@ -56,7 +56,9 @@
       "label": "cola",
       "match_mode": "broad",
       "exact_product_name": null,
-      "excluded_terms": [],
+      "excluded_terms": [
+        "Míchaný"
+      ],
       "visual_key": "cola"
     },
     {
@@ -88,7 +90,7 @@
       "excluded_terms": [
         "tvaroháček"
       ],
-      "visual_key": null
+      "visual_key": "tvaroh"
     }
   ],
   "default_stores": [

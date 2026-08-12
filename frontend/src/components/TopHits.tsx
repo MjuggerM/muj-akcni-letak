@@ -5,10 +5,6 @@ interface TopHitsProps {
   allOffers: Offer[];
 }
 
-function trackedKeyFor(offer: Offer) {
-  return offer.tracking_rule_id ?? (typeof offer.tracked_item === "string" ? offer.tracked_item : offer.tracked_item?.keyword ?? offer.tracked_item?.label ?? "");
-}
-
 const STORE_ORDER = ["lidl", "albert", "penny", "billa"];
 
 function storeOrder(storeId: string | null) {
@@ -53,44 +49,16 @@ export function TopHits({ allOffers }: TopHitsProps) {
             <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
               {offers.map((offer) => {
                 const trackedLabel = typeof offer.tracked_item === "string" ? offer.tracked_item : offer.tracked_item?.label ?? offer.tracked_item?.keyword ?? "";
-                const comparison = allOffers
-                  .filter((candidate) => trackedKeyFor(candidate) === trackedKeyFor(offer))
-                  .filter((candidate) => candidate.price)
-                  .slice()
-                  .sort((a, b) => (a.unit_price ?? Number.POSITIVE_INFINITY) - (b.unit_price ?? Number.POSITIVE_INFINITY))
-                  .reduce<Offer[]>((deduped, candidate) => {
-                    const key = (candidate.store_id ?? candidate.shop_raw ?? "unknown").toLowerCase();
-                    const existing = deduped.find((item) => ((item.store_id ?? item.shop_raw ?? "unknown").toLowerCase()) === key);
-                    if (!existing) {
-                      deduped.push(candidate);
-                      return deduped;
-                    }
-                    if ((candidate.unit_price ?? Number.POSITIVE_INFINITY) < (existing.unit_price ?? Number.POSITIVE_INFINITY)) {
-                      const idx = deduped.indexOf(existing);
-                      deduped[idx] = candidate;
-                    }
-                    return deduped;
-                  }, []);
-                const winner = comparison[0] ?? offer;
-                const isWinner =
-                  (winner.store_id ?? winner.shop_raw ?? "") === (offer.store_id ?? offer.shop_raw ?? "") &&
-                  winner.product_name === offer.product_name &&
-                  winner.price === offer.price;
-                const isBestInStore = offers.reduce((best, candidate) => {
-                  if (candidate.unit_price == null) return best;
-                  if (best == null || candidate.unit_price < best.unit_price!) return candidate;
-                  return best;
-                }, null as Offer | null) === offer;
                 const uniqueKey = `${trackedLabel}-${offer.shop_raw}-${offer.product_name ?? "unknown"}-${offer.price ?? "unknown"}-${offer.unit_price ?? "unknown"}`;
 
                 return (
-                  <article key={uniqueKey} className={`overflow-hidden rounded-2xl bg-stone-900 shadow-sm ring-1 ${isWinner || isBestInStore ? "ring-emerald-500/70" : "ring-stone-700"}`}>
+                  <article key={uniqueKey} className={`overflow-hidden rounded-2xl bg-stone-900 shadow-sm ring-1 ${offer.is_best_deal ? "ring-emerald-500/70" : "ring-stone-700"}`}>
                     <div className="grid gap-3 p-4 sm:grid-cols-[88px_1fr]">
                       <ProductVisual imageUrl={offer.image_url} tag={trackedLabel} visualKey={offer.visual_key} productName={offer.product_name} size="card" />
                       <div className="min-w-0">
                         <div className="flex items-center justify-between gap-2">
                           <p className="truncate text-sm font-semibold text-stone-100">{offer.product_name ?? trackedLabel}</p>
-                          {(isWinner || isBestInStore) && (
+                          {offer.is_best_deal && (
                             <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-emerald-300">
                               Nejlevnější
                             </span>
