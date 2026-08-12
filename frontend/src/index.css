@@ -1,0 +1,12 @@
+@import "tailwindcss";
+
+/* Custom font tokens, used as font-display / font-sans utilities below.
+   Loaded via <link> in index.html; these are just the fallback stacks. */
+@theme {
+  --font-display: "Archivo Black", system-ui, sans-serif;
+  --font-sans: "Inter", system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+}

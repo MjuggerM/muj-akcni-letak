@@ -1,0 +1,100 @@
+{
+  "tracking_rules": [
+    {
+      "id": "vejce",
+      "query": "vejce",
+      "label": "vejce",
+      "match_mode": "broad",
+      "exact_product_name": null,
+      "excluded_terms": [],
+      "visual_key": "vejce"
+    },
+    {
+      "id": "kureci_prsa",
+      "query": "kuřecí prsa",
+      "label": "kuřecí prsa",
+      "match_mode": "broad",
+      "exact_product_name": null,
+      "excluded_terms": [],
+      "visual_key": "kureci"
+    },
+    {
+      "id": "c34e26d5-7d73-475b-b158-174ee310ac9c",
+      "query": "broskve",
+      "label": "broskve",
+      "match_mode": "broad",
+      "exact_product_name": null,
+      "excluded_terms": [
+        "Mrazem"
+      ],
+      "visual_key": null
+    },
+    {
+      "id": "c37af344-9539-4e54-a1f8-84b872b42537",
+      "query": "nektarinky",
+      "label": "nektarinky",
+      "match_mode": "broad",
+      "exact_product_name": null,
+      "excluded_terms": [],
+      "visual_key": "nektarinky"
+    },
+    {
+      "id": "00bf76dc-56f8-4762-8a12-81119c0179b2",
+      "query": "paprika",
+      "label": "paprika",
+      "match_mode": "broad",
+      "exact_product_name": null,
+      "excluded_terms": [
+        "PAPRIKÁŠ",
+        "Koření Paprika"
+      ],
+      "visual_key": "paprika"
+    },
+    {
+      "id": "b966e2c2-bb7b-4527-bab5-09a26eecefd4",
+      "query": "cola",
+      "label": "cola",
+      "match_mode": "broad",
+      "exact_product_name": null,
+      "excluded_terms": [],
+      "visual_key": "cola"
+    },
+    {
+      "id": "b428bdd1-0dcd-41cc-bcbb-829d7a838a6a",
+      "query": "vepřová panenka",
+      "label": "vepřová panenka",
+      "match_mode": "broad",
+      "exact_product_name": null,
+      "excluded_terms": [],
+      "visual_key": "panenka"
+    },
+    {
+      "id": "4e28d036-defc-4189-8350-a1d29ef0c961",
+      "query": "šunka",
+      "label": "šunka",
+      "match_mode": "broad",
+      "exact_product_name": null,
+      "excluded_terms": [
+        "Schwarzwaldská"
+      ],
+      "visual_key": null
+    },
+    {
+      "id": "cf011dd8-5cdd-4186-80fb-95163828044e",
+      "query": "tvaroh",
+      "label": "tvaroh",
+      "match_mode": "broad",
+      "exact_product_name": null,
+      "excluded_terms": [
+        "tvaroháček"
+      ],
+      "visual_key": null
+    }
+  ],
+  "default_stores": [
+    "lidl",
+    "penny",
+    "billa",
+    "albert"
+  ]
+}
