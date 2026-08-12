@@ -28,7 +28,7 @@ from pathlib import Path
 CACHE_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "image_cache.sqlite3"
 
 MISS_TTL_SECONDS = 7 * 24 * 60 * 60  # 7 days - "this product has no photo in OFF"
-FAILURE_TTL_SECONDS = 5 * 60  # 5 minutes - "OFF rate-limited/errored us, retry soon"
+FAILURE_TTL_SECONDS = 90  # 1.5 minutes - "OFF rate-limited/errored us, retry soon"
 
 
 def _connection() -> sqlite3.Connection:
@@ -46,11 +46,41 @@ def _connection() -> sqlite3.Connection:
         )
         """
     )
-    # Older DBs (pre-TTL) won't have `status`/numeric `updated_at`. Add the
-    # column if missing so upgrading doesn't require deleting the cache file.
-    existing_columns = {row[1] for row in connection.execute("PRAGMA table_info(product_image_cache)")}
-    if "status" not in existing_columns:
+    # Older DBs (pre-TTL) declared `updated_at TEXT ... CURRENT_TIMESTAMP`.
+    # That's not just old data - it's an old *column type* (TEXT affinity),
+    # which silently coerces even a freshly-written time.time() float back
+    # into a text string on every INSERT. So ALTER TABLE ADD COLUMN alone
+    # does not fix this: the column itself has to be rebuilt as REAL, or
+    # every future write keeps re-corrupting it. SQLite can't ALTER a
+    # column's type directly, so we rebuild the table when this old shape
+    # is detected. This only ever touches cache data - losing it just means
+    # those entries get re-fetched once.
+    columns = {row[1]: row[2] for row in connection.execute("PRAGMA table_info(product_image_cache)")}
+    needs_rebuild = columns.get("updated_at") == "TEXT"
+    if needs_rebuild:
+        connection.execute("ALTER TABLE product_image_cache RENAME TO product_image_cache_old")
+        connection.execute(
+            """
+            CREATE TABLE product_image_cache (
+                cache_key TEXT PRIMARY KEY,
+                query TEXT NOT NULL,
+                image_url TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'found',
+                source TEXT NOT NULL DEFAULT 'openfoodfacts',
+                updated_at REAL NOT NULL DEFAULT 0
+            )
+            """
+        )
+        # Old rows have no usable numeric timestamp - rather than invent one
+        # (which could wrongly look "fresh" or "expired"), they're dropped;
+        # the next request for that product just re-fetches for real.
+        connection.execute("DROP TABLE product_image_cache_old")
+        connection.commit()
+    elif "status" not in columns:
+        # status-only upgrade path (updated_at was already REAL/unset).
         connection.execute("ALTER TABLE product_image_cache ADD COLUMN status TEXT NOT NULL DEFAULT 'found'")
+        connection.commit()
+
     return connection
 
 
