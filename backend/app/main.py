@@ -105,6 +105,7 @@ async def proxy_image(
     normalized_code = "".join(code.split()) if code else None
     cache_key = f"ean:{normalized_code}" if normalized_code else f"name:{(normalized_query or '').lower()}"
     cached_image_url = get_cached_image_url(cache_key)
+    
     if cached_image_url is not None:
         return {"image_url": cached_image_url}
 
@@ -123,21 +124,35 @@ async def proxy_image(
         raise HTTPException(status_code=422, detail="Zadejte query nebo code.")
 
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
             response = await client.get(target_url)
-            if response.status_code == 429:
-                raise HTTPException(status_code=429, detail="Open Food Facts rate limit exceeded")
+            
+            # Pokud nás OFF zablokuje nebo spadne, prostě vrátíme null (aby React vykreslil placeholder)
+            if response.status_code in [429, 503, 502, 500]:
+                print(f"⚠️ Open Food Facts nestíhá (Status {response.status_code}) pro: {normalized_query or normalized_code}")
+                return {"image_url": None}
+                
             response.raise_for_status()
             payload = response.json()
+            
     except httpx.HTTPStatusError as exc:
-        raise HTTPException(status_code=exc.response.status_code, detail="Open Food Facts request failed") from exc
+        print(f"⚠️ Open Food Facts HTTP chyba {exc.response.status_code}")
+        return {"image_url": None}
     except httpx.RequestError as exc:
-        raise HTTPException(status_code=502, detail="Open Food Facts unreachable") from exc
+        print(f"⚠️ Open Food Facts nedostupný: {exc}")
+        return {"image_url": None}
+    except Exception as exc:
+        print(f"⚠️ Nečekaná chyba při získávání obrázku: {exc}")
+        return {"image_url": None}
 
     products = payload.get("products") or []
     product = next((item for item in products if item.get("image_front_url") or item.get("image_url")), None)
     image_url = product.get("image_front_url") or product.get("image_url") if product else None
     store_cached_image_url(cache_key, normalized_query or normalized_code or "", image_url)
+    
     return {"image_url": image_url}
 
 

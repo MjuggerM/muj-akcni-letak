@@ -35,7 +35,6 @@ function lookupVisualQuery(visualKey: string | null | undefined) {
   if (!visualKey) {
     return null;
   }
-
   return VISUAL_SOURCES[visualKey]?.remoteQuery ?? null;
 }
 
@@ -71,6 +70,9 @@ async function fetchProductImageByEan(ean: string | null | undefined, fallbackUr
 
   const request = (async () => {
     try {
+      // ⏱ Rozprostření dotazů až na 5 vteřin
+      await new Promise((resolve) => setTimeout(resolve, Math.random() * 5000));
+      
       const response = await fetch(`http://localhost:8000/api/proxy-image?code=${encodeURIComponent(normalizedEan)}`);
 
       if (!response.ok) {
@@ -86,8 +88,9 @@ async function fetchProductImageByEan(ean: string | null | undefined, fallbackUr
         return null;
       }
 
-      const data = JSON.parse(rawText) as { image_url?: string | null };
-      return data.image_url ?? null;
+      // Podpora obou formátů (camelCase i snake_case) pro jistotu
+      const data = JSON.parse(rawText) as { image_url?: string | null; imageUrl?: string | null };
+      return data.imageUrl ?? data.image_url ?? null;
     } catch {
       return null;
     }
@@ -123,7 +126,8 @@ async function fetchProductImageByName(productName: string | null, fallbackUrl: 
 
   const request = (async () => {
     try {
-      await new Promise((resolve) => setTimeout(resolve, Math.random() * 2000));
+      // ⏱ Rozprostření dotazů až na 5 vteřin
+      await new Promise((resolve) => setTimeout(resolve, Math.random() * 5000));
 
       const response = await fetch(`http://localhost:8000/api/proxy-image?query=${encodeURIComponent(query)}`);
 
@@ -134,8 +138,9 @@ async function fetchProductImageByName(productName: string | null, fallbackUrl: 
         return null;
       }
 
-      const data = (await response.json()) as { image_url?: string | null };
-      return data.image_url ?? null;
+      // Podpora obou formátů (camelCase i snake_case) pro jistotu
+      const data = (await response.json()) as { image_url?: string | null; imageUrl?: string | null };
+      return data.imageUrl ?? data.image_url ?? null;
     } catch (error) {
       console.error("❌ Chyba při stahování přes backend proxy:", error);
       return null;
