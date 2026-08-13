@@ -28,7 +28,7 @@ logger = logging.getLogger("akcni_letak.proxy")
 
 app = FastAPI(title="Muj akcni letak API")
 
-# Při startu backendu promažeme staré prázdné záznamy
+# Při startu backendu promažeme staré prázdné záznamy, které vznikly předchozím timeoutem
 clear_empty_negative_cache()
 
 app.add_middleware(
@@ -157,7 +157,6 @@ def is_relevant_product(query: str, product_name: str) -> bool:
     q_norm = normalize_str(query)
     p_norm = normalize_str(product_name)
 
-    # Odmítneme tyčinky/snacky pouze pokud se v dotazu výslovně nehledá tyčinka
     mismatch_keywords = ["tycinka", "snack", "krekr", "cracker", "chips", "protein bar"]
     for bad in mismatch_keywords:
         if bad in p_norm and bad not in q_norm:
@@ -178,7 +177,7 @@ def is_relevant_product(query: str, product_name: str) -> bool:
 # --- Open Food Facts image proxy -------------------------------------------
 _off_request_lock = asyncio.Lock()
 _off_last_request_at = 0.0
-_OFF_MIN_INTERVAL_SECONDS = 0.4
+_OFF_MIN_INTERVAL_SECONDS = 0.5
 _OFF_USER_AGENT = "MujAkcniLetak/1.0 (personal project; contact: replace-with-your-email@example.com)"
 
 
@@ -189,11 +188,13 @@ async def _throttled_off_get(client: httpx.AsyncClient, url: str, params: dict) 
         async with _off_request_lock:
             wait = _OFF_MIN_INTERVAL_SECONDS - (time.monotonic() - _off_last_request_at)
             if wait > 0:
+                logger.debug(f"⏳ [Throttling] Čekám {wait:.2f}s před odesláním na OFF...")
                 await asyncio.sleep(wait)
             _off_last_request_at = time.monotonic()
             return await client.get(url, params=params)
 
-    return await asyncio.wait_for(_acquire_and_fetch(), timeout=4.0)
+    # Zvýšeno ze 4.0 na 30.0 sekund, aby dotazy bezpečně přečkaly ve frontě!
+    return await asyncio.wait_for(_acquire_and_fetch(), timeout=30.0)
 
 
 async def fetch_off_image(client: httpx.AsyncClient, search_term: str, original_query: str) -> str | None:
@@ -268,7 +269,8 @@ async def proxy_image(
         headers = {"User-Agent": _OFF_USER_AGENT}
         matched_image_url = None
 
-        async with httpx.AsyncClient(timeout=4.0, headers=headers) as client:
+        # Zvýšeno timeout pro httpx na 15.0, kdyby OFF server vracel data příliš pomalu
+        async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
             # 1. Pokus: Vyčištěný název
             if cleaned_query:
                 matched_image_url = await fetch_off_image(client, cleaned_query, normalized_query or "")
