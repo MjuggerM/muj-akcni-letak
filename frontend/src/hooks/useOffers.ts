@@ -21,6 +21,20 @@ export function useOffers(trackedItems: TrackingRule[], selectedStores: string[]
       return;
     }
 
+    // An empty store selection means every store checkbox is unchecked.
+    // The backend treats an empty `stores` param as "no filter" (see
+    // backend/app/main.py's `stores` query description) - firing that
+    // request anyway would silently fetch and show every store again,
+    // the opposite of what an empty selection visually implies, and a
+    // wasted scrape of every tracked item for stores nobody asked for.
+    // Treat it the same as "nothing to show" instead.
+    if (selectedStores.length === 0) {
+      setOffers([]);
+      setFetchedAt(null);
+      setError(null);
+      return;
+    }
+
     let cancelled = false;
     setLoading(true);
     setError(null);
@@ -47,7 +61,11 @@ export function useOffers(trackedItems: TrackingRule[], selectedStores: string[]
     return () => {
       cancelled = true;
     };
-  }, [trackedItems, selectedStores, refreshKey]);
+    // includeMissing was previously missing from this array, so toggling
+    // "Zobrazit i sledované položky mimo akci" changed state but never
+    // actually re-fetched - the checkbox looked like it did nothing until
+    // some other dependency happened to change too.
+  }, [trackedItems, selectedStores, includeMissing, refreshKey]);
 
   function refetch() {
     setRefreshKey((k) => k + 1);

@@ -30,3 +30,8 @@ CACHE_TTL_SECONDS = 20 * 60
 # API as well as in the UI so a direct API caller cannot trigger an excessive
 # number of scraper requests.
 MAX_TRACKED_ITEMS = 50
+
+# How long (days) we trust a *negative* product-image lookup (i.e. Open Food
+# Facts had nothing for that product name/EAN) before the backend is allowed
+# to ask again. Positive hits are cached indefinitely - see app/image_cache.py.
+IMAGE_NEGATIVE_CACHE_TTL_DAYS = 30

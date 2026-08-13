@@ -1,4 +1,5 @@
 import asyncio
+import time
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -6,12 +7,12 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import TypeAdapter, ValidationError
 
 from .config import MAX_TRACKED_ITEMS, STORES
-from .image_cache import get_cache_entry, store_cached_image_url
+from .image_cache import get_cached_image_url, store_cached_image_url
 from .kupi_service import build_store_summaries, build_top_hits, get_offers_for_rules, get_product_suggestions
 from .schemas import Offer, OffersResponse, StoreOut, StoreSummary, TrackingRule
+from pydantic import TypeAdapter, ValidationError
 
 app = FastAPI(title="Muj akcni letak API")
 
@@ -23,13 +24,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Open Food Facts is a shared, free, rate-limited API. Firing 20+ parallel
-# lookups (one per tracked item x store) at it is what triggers 429s in the
-# first place. A small semaphore serializes-ish our outbound calls without
-# blocking the rest of the API (each /api/offers request still returns
-# immediately; only the image lookups queue up behind this).
-_OFF_CONCURRENCY = asyncio.Semaphore(2)
 
 
 @app.get("/api/health")
@@ -104,6 +98,42 @@ async def product_suggestions(query: str = Query(..., min_length=2, max_length=8
     return await get_product_suggestions(query.strip())
 
 
+# --- Open Food Facts image proxy -------------------------------------------
+#
+# Open Food Facts enforces 10 requests/minute/IP for *search* queries
+# (GET /api/v*/search or /cgi/search.pl) and reserves the right to IP-ban
+# clients who exceed it:
+# https://openfoodfacts.github.io/openfoodfacts-server/api/
+# A single page load here can need lookups for a few dozen distinct
+# products (tracked items x stores), which blows straight past that limit
+# if they all go out together - the frontend's random 0-5s spread in
+# ProductVisual.tsx does not, by itself, guarantee staying under a
+# per-minute budget, it only avoids everything firing in the exact same
+# instant. This lock forces every actual outbound OFF request from this
+# backend - no matter how many /api/proxy-image calls arrive concurrently -
+# to be spaced out safely under the limit.
+_off_request_lock = asyncio.Lock()
+_off_last_request_at = 0.0
+_OFF_MIN_INTERVAL_SECONDS = 6.5  # ~9.2 req/min, safely under OFF's 10/min
+
+# OFF asks every client to identify itself with a descriptive User-Agent
+# (format: "AppName/Version (contact)") and warns that generic/browser-like
+# UAs risk being treated as a bot. Put a real contact address here if you
+# have one - it's also how OFF would reach you if this app ever got
+# throttled or banned by mistake.
+_OFF_USER_AGENT = "MujAkcniLetak/1.0 (personal project; contact: replace-with-your-email@example.com)"
+
+
+async def _throttled_off_get(client: httpx.AsyncClient, url: str, params: dict) -> httpx.Response:
+    global _off_last_request_at
+    async with _off_request_lock:
+        wait = _OFF_MIN_INTERVAL_SECONDS - (time.monotonic() - _off_last_request_at)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _off_last_request_at = time.monotonic()
+    return await client.get(url, params=params)
+
+
 @app.get("/api/proxy-image")
 async def proxy_image(
     query: str | None = Query(None, min_length=2, max_length=120),
@@ -111,43 +141,55 @@ async def proxy_image(
 ) -> dict:
     normalized_query = " ".join(query.split()) if query else None
     normalized_code = "".join(code.split()) if code else None
-    cache_key = f"ean:{normalized_code}" if normalized_code else f"name:{(normalized_query or '').lower()}"
-
-    cached = get_cache_entry(cache_key)
-    if cached is not None:
-        # Covers all three outcomes: a real image, a confirmed miss, or a
-        # still-fresh "we got rate-limited, don't hammer OFF again yet".
-        # Only an *expired* failure/miss falls through to a real fetch.
-        return {"image_url": cached["image_url"]}
-
-    if normalized_code:
-        target_url = (
-            "https://world.openfoodfacts.org/api/v2/search"
-            f"?code={normalized_code}&fields=product_name,image_front_url,image_url"
-        )
-    elif normalized_query:
-        target_url = (
-            "https://world.openfoodfacts.org/cgi/search.pl"
-            f"?search_terms={normalized_query}&search_simple=1&action=process&json=1&page_size=1"
-            "&fields=product_name,image_front_url,image_url"
-        )
-    else:
+    if not normalized_code and not normalized_query:
         raise HTTPException(status_code=422, detail="Zadejte query nebo code.")
 
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        async with _OFF_CONCURRENCY:
-            async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
-                response = await client.get(target_url)
+    cache_key = f"ean:{normalized_code}" if normalized_code else f"name:{(normalized_query or '').lower()}"
+    cached_image_url = get_cached_image_url(cache_key)
 
+    # None -> never looked up, go fetch it.
+    # ""   -> already looked up, confirmed no image, still fresh - do NOT
+    #         hit Open Food Facts again for something we already know it
+    #         doesn't have (this used to be the main source of repeated,
+    #         avoidable calls - see image_cache.get_cached_image_url).
+    # url  -> a previously found image.
+    if cached_image_url is not None:
+        return {"image_url": cached_image_url or None}
+
+    if normalized_code:
+        target_url = "https://world.openfoodfacts.org/api/v2/search"
+        request_params = {
+            "code": normalized_code,
+            "fields": "product_name,image_front_url,image_url",
+        }
+    else:
+        # NOTE: this is Open Food Facts' legacy free-text search backend.
+        # OFF has been migrating full-text search to a separate service
+        # ("search-a-licious", at search.openfoodfacts.org) and this
+        # legacy endpoint has had reported outages independent of rate
+        # limiting. It's used here because its JSON shape
+        # (`{"products": [...]}`) is well-documented and matches the
+        # parsing below; if images still fail a lot after this fix (i.e.
+        # not just for genuinely-missing products), this endpoint's own
+        # reliability is the next thing to look at.
+        target_url = "https://world.openfoodfacts.org/cgi/search.pl"
+        request_params = {
+            "search_terms": normalized_query,
+            "search_simple": "1",
+            "action": "process",
+            "json": "1",
+            "page_size": "1",
+            "fields": "product_name,image_front_url,image_url",
+        }
+
+    try:
+        headers = {"User-Agent": _OFF_USER_AGENT}
+        async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
+            response = await _throttled_off_get(client, target_url, request_params)
+
+            # Pokud nás OFF zablokuje nebo spadne, prostě vrátíme null (aby React vykreslil placeholder)
             if response.status_code in (429, 503, 502, 500):
                 print(f"⚠️ Open Food Facts nestíhá (Status {response.status_code}) pro: {normalized_query or normalized_code}")
-                # Cache as a short-lived FAILURE, not a permanent miss - the
-                # next request for the same product after FAILURE_TTL_SECONDS
-                # will retry for real instead of repeating the same 429.
-                store_cached_image_url(cache_key, normalized_query or normalized_code or "", None, status="failure")
                 return {"image_url": None}
 
             response.raise_for_status()
@@ -155,30 +197,18 @@ async def proxy_image(
 
     except httpx.HTTPStatusError as exc:
         print(f"⚠️ Open Food Facts HTTP chyba {exc.response.status_code}")
-        store_cached_image_url(cache_key, normalized_query or normalized_code or "", None, status="failure")
         return {"image_url": None}
     except httpx.RequestError as exc:
         print(f"⚠️ Open Food Facts nedostupný: {exc}")
-        store_cached_image_url(cache_key, normalized_query or normalized_code or "", None, status="failure")
         return {"image_url": None}
     except Exception as exc:
         print(f"⚠️ Nečekaná chyba při získávání obrázku: {exc}")
-        store_cached_image_url(cache_key, normalized_query or normalized_code or "", None, status="failure")
         return {"image_url": None}
 
     products = payload.get("products") or []
     product = next((item for item in products if item.get("image_front_url") or item.get("image_url")), None)
-    image_url = product.get("image_front_url") or product.get("image_url") if product else None
-
-    # A clean response with no matching image is a confirmed MISS - OFF
-    # genuinely doesn't have this product's photo. That's stable information,
-    # worth caching for a week, not something to re-ask on every page load.
-    store_cached_image_url(
-        cache_key,
-        normalized_query or normalized_code or "",
-        image_url,
-        status="found" if image_url else "miss",
-    )
+    image_url = (product.get("image_front_url") or product.get("image_url")) if product else None
+    store_cached_image_url(cache_key, normalized_query or normalized_code or "", image_url)
 
     return {"image_url": image_url}
 

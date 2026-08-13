@@ -6,48 +6,21 @@ interface ProductVisualProps {
   imageUrl: string | null;
   tag: string;
   visualKey?: string | null;
+  ean?: string | null;
   productName: string | null;
   size?: "card" | "hit";
 }
 
-// In-memory within this tab's lifetime: avoids duplicate network calls for
-// the same product appearing in both OfferList and TopHits at once.
 const imageCache = new Map<string, Promise<string | null>>();
-
-// Backed by sessionStorage so a page reload doesn't forget we were just
-// rate-limited and immediately re-fire the same request. This is a client-side
-// safety net; the real fix is the backend's own short-lived failure cache in
-// image_cache.py, which is shared across all users/tabs. This just keeps a
-// single tab from re-asking for what it already knows was recently refused.
-const COOLDOWN_STORAGE_KEY = "muj-akcni-letak:image-cooldowns";
-const COOLDOWN_MS = 15000;
-
-function readCooldowns(): Record<string, number> {
-  try {
-    return JSON.parse(sessionStorage.getItem(COOLDOWN_STORAGE_KEY) ?? "{}");
-  } catch {
-    return {};
-  }
-}
+const requestCooldown = new Map<string, number>();
 
 function canRequestAgain(cacheKey: string) {
-  const cooldowns = readCooldowns();
   const now = Date.now();
-  const lastRequest = cooldowns[cacheKey] ?? 0;
-  if (now - lastRequest < COOLDOWN_MS) {
+  const lastRequest = requestCooldown.get(cacheKey) ?? 0;
+  if (now - lastRequest < 15000) {
     return false;
   }
-  cooldowns[cacheKey] = now;
-  // Trim old entries so this doesn't grow unbounded over a long session.
-  for (const key of Object.keys(cooldowns)) {
-    if (now - cooldowns[key] > COOLDOWN_MS * 10) delete cooldowns[key];
-  }
-  try {
-    sessionStorage.setItem(COOLDOWN_STORAGE_KEY, JSON.stringify(cooldowns));
-  } catch {
-    // sessionStorage full or unavailable (e.g. private mode) - degrade to
-    // "always allow", which just means we lose the cross-reload cooldown.
-  }
+  requestCooldown.set(cacheKey, now);
   return true;
 }
 
@@ -66,8 +39,29 @@ function lookupVisualQuery(visualKey: string | null | undefined) {
   return VISUAL_SOURCES[visualKey]?.remoteQuery ?? null;
 }
 
-function resolveImageQuery(productName: string | null, tag: string, visualKey: string | null | undefined) {
-  return normalizeQuery(productName) || normalizeQuery(tag) || lookupVisualQuery(visualKey) || null;
+// Ordered, de-duplicated search terms to try against the backend image
+// proxy: the specific scraped product name first (best match when it
+// hits), then the raw tracked keyword, then - as a last resort - the
+// broad category term from visuals.ts (e.g. "chicken meat" instead of
+// "Kuřecí prsní řízky Vodňanské kuře 500g"). Specific Czech branded
+// product names very often have no match in Open Food Facts at all, so
+// falling back to a broad category term meaningfully increases the odds
+// of getting *some* representative photo instead of a plain placeholder.
+// This costs at most 2 extra backend requests per product, and only for
+// products that miss on the first try - and thanks to the fixed negative
+// caching in image_cache.py, that's a one-time cost per product name, not
+// a recurring one.
+function resolveImageQueries(productName: string | null, tag: string, visualKey: string | null | undefined) {
+  const candidates = [normalizeQuery(productName), normalizeQuery(tag), lookupVisualQuery(visualKey)];
+  const seen = new Set<string>();
+  const queries: string[] = [];
+  for (const candidate of candidates) {
+    if (candidate && !seen.has(candidate.toLowerCase())) {
+      seen.add(candidate.toLowerCase());
+      queries.push(candidate);
+    }
+  }
+  return queries;
 }
 
 function Placeholder({ label, sizeClass }: { label: string; sizeClass: string }) {
@@ -79,6 +73,68 @@ function Placeholder({ label, sizeClass }: { label: string; sizeClass: string })
       {label}
     </div>
   );
+}
+
+// NOTE: `ean` is currently always undefined in practice. kupiapi's raw
+// scraper output (backend/app/kupi_service.py) only ever contains name /
+// shops / prices / amounts / validities - no barcode field exists
+// anywhere in the library (checked directly against its source, both the
+// published PyPI package and the current GitHub main branch), and
+// backend/app/schemas.py's Offer model has no `ean` field either. So this
+// function never actually fires a request today - it's kept because it's
+// harmless and free to leave in if EAN scraping is ever added upstream.
+// If you don't plan to add that, you can delete this function, the `ean`
+// prop, and its call site below without losing anything that currently works.
+async function fetchProductImageByEan(ean: string | null | undefined, fallbackUrl: string | null) {
+  if (isValidImageUrl(fallbackUrl)) {
+    return fallbackUrl;
+  }
+
+  const normalizedEan = normalizeQuery(ean);
+  if (!normalizedEan || normalizedEan.length < 8) {
+    return null;
+  }
+
+  const cacheKey = `ean:${normalizedEan}`;
+  if (imageCache.has(cacheKey)) {
+    return imageCache.get(cacheKey)!;
+  }
+
+  const request = (async () => {
+    try {
+      // ⏱ Rozprostření dotazů až na 5 vteřin
+      await new Promise((resolve) => setTimeout(resolve, Math.random() * 5000));
+
+      const response = await fetch(`${API_BASE_URL}/api/proxy-image?code=${encodeURIComponent(normalizedEan)}`);
+
+      if (!response.ok) {
+        if (response.status === 429) {
+          console.error("❌ API nás zablokovalo (Rate Limit) pro EAN:", normalizedEan);
+        }
+        return null;
+      }
+
+      const contentType = response.headers.get("content-type") ?? "";
+      const rawText = await response.text();
+      if (!rawText || !contentType.includes("application/json")) {
+        return null;
+      }
+
+      // Podpora obou formátů (camelCase i snake_case) pro jistotu
+      const data = JSON.parse(rawText) as { image_url?: string | null; imageUrl?: string | null };
+      return data.imageUrl ?? data.image_url ?? null;
+    } catch {
+      return null;
+    }
+  })();
+
+  imageCache.set(cacheKey, request);
+
+  request.then((res) => {
+    if (!res) imageCache.delete(cacheKey);
+  }).catch(() => imageCache.delete(cacheKey));
+
+  return request;
 }
 
 async function fetchProductImageByName(productName: string | null, fallbackUrl: string | null) {
@@ -102,6 +158,9 @@ async function fetchProductImageByName(productName: string | null, fallbackUrl: 
 
   const request = (async () => {
     try {
+      // ⏱ Rozprostření dotazů až na 5 vteřin
+      await new Promise((resolve) => setTimeout(resolve, Math.random() * 5000));
+
       const response = await fetch(`${API_BASE_URL}/api/proxy-image?query=${encodeURIComponent(query)}`);
 
       if (!response.ok) {
@@ -111,6 +170,7 @@ async function fetchProductImageByName(productName: string | null, fallbackUrl: 
         return null;
       }
 
+      // Podpora obou formátů (camelCase i snake_case) pro jistotu
       const data = (await response.json()) as { image_url?: string | null; imageUrl?: string | null };
       return data.imageUrl ?? data.image_url ?? null;
     } catch (error) {
@@ -121,17 +181,14 @@ async function fetchProductImageByName(productName: string | null, fallbackUrl: 
 
   imageCache.set(cacheKey, request);
 
-  // On a null result we deliberately do NOT delete the cache entry anymore:
-  // the backend now remembers "miss"/"failure" outcomes itself (with its own
-  // TTLs), so re-fetching on every re-render here would defeat that and just
-  // recreate the original problem. The per-tab cooldown above already gates
-  // retries; letting this promise cache stand means we won't even ask again
-  // within the same tab until a fresh mount needs it.
+  request.then((res) => {
+    if (!res) imageCache.delete(cacheKey);
+  }).catch(() => imageCache.delete(cacheKey));
 
   return request;
 }
 
-export function ProductVisual({ imageUrl, tag, visualKey, productName, size = "card" }: ProductVisualProps) {
+export function ProductVisual({ imageUrl, tag, visualKey, ean, productName, size = "card" }: ProductVisualProps) {
   const [resolvedImage, setResolvedImage] = useState<string | null>(imageUrl ?? null);
   const [imageFailed, setImageFailed] = useState(false);
   const [isFetching, setIsFetching] = useState(!isValidImageUrl(imageUrl));
@@ -151,10 +208,15 @@ export function ProductVisual({ imageUrl, tag, visualKey, productName, size = "c
       };
     }
 
-    const sourceName = resolveImageQuery(productName, tag, visualKey);
-
     void (async () => {
-      const image = await fetchProductImageByName(sourceName, nextImage);
+      let image = await fetchProductImageByEan(ean, nextImage);
+
+      if (!image) {
+        for (const query of resolveImageQueries(productName, tag, visualKey)) {
+          image = await fetchProductImageByName(query, nextImage);
+          if (image) break;
+        }
+      }
 
       if (!isActive) {
         return;
@@ -167,7 +229,7 @@ export function ProductVisual({ imageUrl, tag, visualKey, productName, size = "c
     return () => {
       isActive = false;
     };
-  }, [imageUrl, productName, tag, visualKey]);
+  }, [ean, imageUrl, productName, tag, visualKey]);
 
   if (isFetching || !resolvedImage || imageFailed) {
     const placeholderLabel = (productName ?? tag ?? lookupVisualQuery(visualKey) ?? "foto").slice(0, 12);
