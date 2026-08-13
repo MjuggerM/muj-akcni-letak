@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 from datetime import datetime, timezone
 import json
@@ -14,9 +15,17 @@ from .kupi_service import build_store_summaries, build_top_hits, get_offers_for_
 from .schemas import Offer, OffersResponse, StoreOut, StoreSummary, TrackingRule
 from pydantic import TypeAdapter, ValidationError
 
+# ------------------------------------------------------------------------------
+# KONFIGURACE LOGOVÁNÍ
+# ------------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("akcni_letak")
+
 app = FastAPI(title="Muj akcni letak API")
 
-# Dev-friendly CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,7 +54,8 @@ def get_preferences() -> dict:
         data = json.loads(prefs_path.read_text(encoding="utf-8"))
         rules = data.get("tracking_rules") or []
         return {"tracking_rules": rules, "default_stores": data.get("default_stores", list(STORES.keys()))}
-    except Exception:
+    except Exception as exc:
+        logger.warning(f"Chyba při čtení preferences.json: {exc}")
         return {"tracking_rules": [], "default_stores": list(STORES.keys())}
 
 
@@ -63,6 +73,7 @@ def set_preferences(prefs: dict) -> dict:
         )
         return {"ok": True}
     except Exception as exc:
+        logger.error(f"Chyba při zápisu preferences.json: {exc}")
         return {"ok": False, "error": str(exc)}
 
 
@@ -100,26 +111,24 @@ async def product_suggestions(query: str = Query(..., min_length=2, max_length=8
 # --- Open Food Facts image proxy -------------------------------------------
 _off_request_lock = asyncio.Lock()
 _off_last_request_at = 0.0
-# Zkráceno z 6.5s na rozumný interval, aby požadavky neumíraly na timeout
-_OFF_MIN_INTERVAL_SECONDS = 1.0  
+_OFF_MIN_INTERVAL_SECONDS = 1.0
 
 _OFF_USER_AGENT = "MujAkcniLetak/1.0 (personal project; contact: replace-with-your-email@example.com)"
 
 
 async def _throttled_off_get(client: httpx.AsyncClient, url: str, params: dict) -> httpx.Response:
     global _off_last_request_at
-    # Přidán timeout pro získávaní zámku (max 3 sekundy čekání ve frontě)
-    try:
-        async with asyncio.timeout(3.0):
-            async with _off_request_lock:
-                wait = _OFF_MIN_INTERVAL_SECONDS - (time.monotonic() - _off_last_request_at)
-                if wait > 0:
-                    await asyncio.sleep(wait)
-                _off_last_request_at = time.monotonic()
-                return await client.get(url, params=params)
-    except TimeoutError:
-        # Pokud je ve frontě moc požadavků, vyhodíme výjimku a vrátíme None (placeholder v UI)
-        raise httpx.RequestError("Fronta požadavků na obrázky je plná.")
+
+    async def _acquire_and_fetch():
+        async with _off_request_lock:
+            wait = _OFF_MIN_INTERVAL_SECONDS - (time.monotonic() - _off_last_request_at)
+            if wait > 0:
+                logger.debug(f"Čekám {wait:.2f}s před dalším dotazem na OFF...")
+                await asyncio.sleep(wait)
+            _off_last_request_at = time.monotonic()
+            return await client.get(url, params=params)
+
+    return await asyncio.wait_for(_acquire_and_fetch(), timeout=4.0)
 
 
 @app.get("/api/proxy-image")
@@ -127,74 +136,79 @@ async def proxy_image(
     query: str | None = Query(None, min_length=2, max_length=120),
     code: str | None = Query(None, min_length=8, max_length=32),
 ) -> dict:
-    normalized_query = " ".join(query.split()) if query else None
-    normalized_code = "".join(code.split()) if code else None
-    if not normalized_code and not normalized_query:
-        raise HTTPException(status_code=422, detail="Zadejte query nebo code.")
-
-    cache_key = f"ean:{normalized_code}" if normalized_code else f"name:{(normalized_query or '').lower()}"
-    cached_image_url = get_cached_image_url(cache_key)
-
-    if cached_image_url is not None:
-        return {"image_url": cached_image_url or None}
-
-    if normalized_code:
-        target_url = "https://world.openfoodfacts.org/api/v2/search"
-        request_params = {
-            "code": normalized_code,
-            "fields": "product_name,image_front_url,image_url",
-        }
-    else:
-        target_url = "https://world.openfoodfacts.org/cgi/search.pl"
-        request_params = {
-            "search_terms": normalized_query,
-            "search_simple": "1",
-            "action": "process",
-            "json": "1",
-            "page_size": "1",
-            "fields": "product_name,image_front_url,image_url",
-        }
+    search_label = query or code or "neznámý"
+    logger.info(f"🖼️ [ProxyImage] Požadavek na obrázek: '{search_label}'")
 
     try:
+        normalized_query = " ".join(query.split()) if query else None
+        normalized_code = "".join(code.split()) if code else None
+        if not normalized_code and not normalized_query:
+            logger.warning("⚠️ [ProxyImage] Zaznamenán dotaz bez 'query' i 'code'")
+            return {"image_url": None}
+
+        cache_key = f"ean:{normalized_code}" if normalized_code else f"name:{(normalized_query or '').lower()}"
+        cached_image_url = get_cached_image_url(cache_key)
+
+        if cached_image_url is not None:
+            logger.info(f"⚡ [ProxyImage] Cache hit pro '{search_label}' -> {cached_image_url or 'Nenalezeno (Cached)'}")
+            return {"image_url": cached_image_url or None}
+
+        logger.info(f"🌐 [ProxyImage] Cache miss, volám Open Food Facts pro '{search_label}'")
+
+        if normalized_code:
+            target_url = "https://world.openfoodfacts.org/api/v2/search"
+            request_params = {
+                "code": normalized_code,
+                "fields": "product_name,image_front_url,image_url",
+            }
+        else:
+            target_url = "https://world.openfoodfacts.org/cgi/search.pl"
+            request_params = {
+                "search_terms": normalized_query,
+                "search_simple": "1",
+                "action": "process",
+                "json": "1",
+                "page_size": "1",
+                "fields": "product_name,image_front_url,image_url",
+            }
+
         headers = {"User-Agent": _OFF_USER_AGENT}
-        # Krátký timeout 5s na samotný požadavek
         async with httpx.AsyncClient(timeout=5.0, headers=headers) as client:
             response = await _throttled_off_get(client, target_url, request_params)
 
-            if response.status_code in (429, 503, 502, 500):
-                print(f"⚠️ Open Food Facts nestíhá (Status {response.status_code}) pro: {normalized_query or normalized_code}")
-                # Uložíme prázdný výsledek do cache, ať to na stejný produkt znovu nezkouší
+            if response.status_code != 200:
+                logger.warning(f"⚠️ [ProxyImage] OFF vrátil status {response.status_code} pro '{search_label}'")
                 store_cached_image_url(cache_key, normalized_query or normalized_code or "", None)
                 return {"image_url": None}
 
-            response.raise_for_status()
             payload = response.json()
 
-    except (httpx.HTTPStatusError, httpx.RequestError, Exception) as exc:
-        print(f"⚠️ Chyba při získávání obrázku pro '{normalized_query or normalized_code}': {exc}")
-        # Při chybě uložíme prázdný záznam do cache, aby nepohřbil další požadavky v pořadí
-        store_cached_image_url(cache_key, normalized_query or normalized_code or "", None)
+        products = payload.get("products") or []
+        product = next((item for item in products if item.get("image_front_url") or item.get("image_url")), None)
+        image_url = (product.get("image_front_url") or product.get("image_url")) if product else None
+
+        logger.info(f"✅ [ProxyImage] Obrázek získej pro '{search_label}' -> {image_url or 'Nenalezeno'}")
+        store_cached_image_url(cache_key, normalized_query or normalized_code or "", image_url)
+        return {"image_url": image_url}
+
+    except asyncio.TimeoutError:
+        logger.warning(f"⏱️ [ProxyImage] Vypršel časový limit (Timeout) pro '{search_label}'")
         return {"image_url": None}
 
-    products = payload.get("products") or []
-    product = next((item for item in products if item.get("image_front_url") or item.get("image_url")), None)
-    image_url = (product.get("image_front_url") or product.get("image_url")) if product else None
-    store_cached_image_url(cache_key, normalized_query or normalized_code or "", image_url)
-
-    return {"image_url": image_url}
+    except Exception as exc:
+        # Zaznamená celou chybovou výjimku (Stack trace) do konzole
+        logger.error(f"❌ [ProxyImage] Neočekávaná chyba u '{search_label}': {exc}", exc_info=True)
+        return {"image_url": None}
 
 
 @app.get("/api/offers", response_model=OffersResponse)
 async def offers(
-    items: str = Query(
-        "", description="Legacy comma-separated tracked items, e.g. 'vejce,kureci prsa'"
-    ),
+    items: str = Query("", description="Legacy comma-separated tracked items"),
     rules: str | None = Query(None, description="JSON array of broad or exact tracking rules."),
-    stores: str = Query(
-        "", description="Comma-separated store IDs, e.g. 'lidl,albert'. Empty = no filter."
-    ),
-    include_missing: bool = Query(False, description="Include items not currently on sale as explicit entries."),
+    stores: str = Query("", description="Comma-separated store IDs"),
+    include_missing: bool = Query(False, description="Include items not currently on sale"),
 ) -> dict:
+    logger.info(f"📊 [Offers] Načítám nabídky pro rules='{rules or items}', stores='{stores}'")
     tracking_rules = parse_tracking_rules(items, rules)
     store_ids = {s.strip() for s in stores.split(",") if s.strip()} or None
 
