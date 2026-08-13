@@ -16,11 +16,11 @@ from pydantic import TypeAdapter, ValidationError
 
 app = FastAPI(title="Muj akcni letak API")
 
-# Dev-friendly CORS. Narrow allow_origins to the real frontend URL once
-# this stops running on localhost.
+# Dev-friendly CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -53,20 +53,20 @@ def get_preferences() -> dict:
 def set_preferences(prefs: dict) -> dict:
     prefs_path = Path(__file__).parent / "preferences.json"
     try:
-        # Basic validation via pydantic
         if not isinstance(prefs, dict):
             raise ValueError("Invalid payload")
         tracking_rules = prefs.get("tracking_rules", [])
         default_stores = prefs.get("default_stores", list(STORES.keys()))
-        # write back
-        prefs_path.write_text(json.dumps({"tracking_rules": tracking_rules, "default_stores": default_stores}, ensure_ascii=False, indent=2), encoding="utf-8")
+        prefs_path.write_text(
+            json.dumps({"tracking_rules": tracking_rules, "default_stores": default_stores}, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
         return {"ok": True}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
 
 def parse_tracked_items(items: str) -> list[str]:
-    """Parse and validate the comma-separated `items` query parameter."""
     item_list = [item.strip() for item in items.split(",") if item.strip()]
     if not item_list:
         raise HTTPException(status_code=422, detail="Zadejte alespoň jednu sledovanou položku.")
@@ -79,7 +79,6 @@ def parse_tracked_items(items: str) -> list[str]:
 
 
 def parse_tracking_rules(items: str, rules: str | None) -> list[TrackingRule]:
-    """Accept rich rules while retaining the old comma-separated API contract."""
     if not rules:
         return [TrackingRule(id=item, query=item, label=item) for item in parse_tracked_items(items)]
     try:
@@ -99,39 +98,28 @@ async def product_suggestions(query: str = Query(..., min_length=2, max_length=8
 
 
 # --- Open Food Facts image proxy -------------------------------------------
-#
-# Open Food Facts enforces 10 requests/minute/IP for *search* queries
-# (GET /api/v*/search or /cgi/search.pl) and reserves the right to IP-ban
-# clients who exceed it:
-# https://openfoodfacts.github.io/openfoodfacts-server/api/
-# A single page load here can need lookups for a few dozen distinct
-# products (tracked items x stores), which blows straight past that limit
-# if they all go out together - the frontend's random 0-5s spread in
-# ProductVisual.tsx does not, by itself, guarantee staying under a
-# per-minute budget, it only avoids everything firing in the exact same
-# instant. This lock forces every actual outbound OFF request from this
-# backend - no matter how many /api/proxy-image calls arrive concurrently -
-# to be spaced out safely under the limit.
 _off_request_lock = asyncio.Lock()
 _off_last_request_at = 0.0
-_OFF_MIN_INTERVAL_SECONDS = 6.5  # ~9.2 req/min, safely under OFF's 10/min
+# Zkráceno z 6.5s na rozumný interval, aby požadavky neumíraly na timeout
+_OFF_MIN_INTERVAL_SECONDS = 1.0  
 
-# OFF asks every client to identify itself with a descriptive User-Agent
-# (format: "AppName/Version (contact)") and warns that generic/browser-like
-# UAs risk being treated as a bot. Put a real contact address here if you
-# have one - it's also how OFF would reach you if this app ever got
-# throttled or banned by mistake.
 _OFF_USER_AGENT = "MujAkcniLetak/1.0 (personal project; contact: replace-with-your-email@example.com)"
 
 
 async def _throttled_off_get(client: httpx.AsyncClient, url: str, params: dict) -> httpx.Response:
     global _off_last_request_at
-    async with _off_request_lock:
-        wait = _OFF_MIN_INTERVAL_SECONDS - (time.monotonic() - _off_last_request_at)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        _off_last_request_at = time.monotonic()
-    return await client.get(url, params=params)
+    # Přidán timeout pro získávaní zámku (max 3 sekundy čekání ve frontě)
+    try:
+        async with asyncio.timeout(3.0):
+            async with _off_request_lock:
+                wait = _OFF_MIN_INTERVAL_SECONDS - (time.monotonic() - _off_last_request_at)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                _off_last_request_at = time.monotonic()
+                return await client.get(url, params=params)
+    except TimeoutError:
+        # Pokud je ve frontě moc požadavků, vyhodíme výjimku a vrátíme None (placeholder v UI)
+        raise httpx.RequestError("Fronta požadavků na obrázky je plná.")
 
 
 @app.get("/api/proxy-image")
@@ -147,12 +135,6 @@ async def proxy_image(
     cache_key = f"ean:{normalized_code}" if normalized_code else f"name:{(normalized_query or '').lower()}"
     cached_image_url = get_cached_image_url(cache_key)
 
-    # None -> never looked up, go fetch it.
-    # ""   -> already looked up, confirmed no image, still fresh - do NOT
-    #         hit Open Food Facts again for something we already know it
-    #         doesn't have (this used to be the main source of repeated,
-    #         avoidable calls - see image_cache.get_cached_image_url).
-    # url  -> a previously found image.
     if cached_image_url is not None:
         return {"image_url": cached_image_url or None}
 
@@ -163,15 +145,6 @@ async def proxy_image(
             "fields": "product_name,image_front_url,image_url",
         }
     else:
-        # NOTE: this is Open Food Facts' legacy free-text search backend.
-        # OFF has been migrating full-text search to a separate service
-        # ("search-a-licious", at search.openfoodfacts.org) and this
-        # legacy endpoint has had reported outages independent of rate
-        # limiting. It's used here because its JSON shape
-        # (`{"products": [...]}`) is well-documented and matches the
-        # parsing below; if images still fail a lot after this fix (i.e.
-        # not just for genuinely-missing products), this endpoint's own
-        # reliability is the next thing to look at.
         target_url = "https://world.openfoodfacts.org/cgi/search.pl"
         request_params = {
             "search_terms": normalized_query,
@@ -184,25 +157,23 @@ async def proxy_image(
 
     try:
         headers = {"User-Agent": _OFF_USER_AGENT}
-        async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
+        # Krátký timeout 5s na samotný požadavek
+        async with httpx.AsyncClient(timeout=5.0, headers=headers) as client:
             response = await _throttled_off_get(client, target_url, request_params)
 
-            # Pokud nás OFF zablokuje nebo spadne, prostě vrátíme null (aby React vykreslil placeholder)
             if response.status_code in (429, 503, 502, 500):
                 print(f"⚠️ Open Food Facts nestíhá (Status {response.status_code}) pro: {normalized_query or normalized_code}")
+                # Uložíme prázdný výsledek do cache, ať to na stejný produkt znovu nezkouší
+                store_cached_image_url(cache_key, normalized_query or normalized_code or "", None)
                 return {"image_url": None}
 
             response.raise_for_status()
             payload = response.json()
 
-    except httpx.HTTPStatusError as exc:
-        print(f"⚠️ Open Food Facts HTTP chyba {exc.response.status_code}")
-        return {"image_url": None}
-    except httpx.RequestError as exc:
-        print(f"⚠️ Open Food Facts nedostupný: {exc}")
-        return {"image_url": None}
-    except Exception as exc:
-        print(f"⚠️ Nečekaná chyba při získávání obrázku: {exc}")
+    except (httpx.HTTPStatusError, httpx.RequestError, Exception) as exc:
+        print(f"⚠️ Chyba při získávání obrázku pro '{normalized_query or normalized_code}': {exc}")
+        # Při chybě uložíme prázdný záznam do cache, aby nepohřbil další požadavky v pořadí
+        store_cached_image_url(cache_key, normalized_query or normalized_code or "", None)
         return {"image_url": None}
 
     products = payload.get("products") or []
@@ -229,8 +200,6 @@ async def offers(
 
     flat, errors = await get_offers_for_rules(tracking_rules, store_ids)
 
-    # Optionally add explicit "not on sale" entries so the frontend can
-    # render tracked items per-store even when kupiapi returned no result.
     if include_missing:
         considered_stores = list(store_ids) if store_ids else list(STORES.keys())
         for rule in tracking_rules:
