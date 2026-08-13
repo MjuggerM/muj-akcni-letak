@@ -1,6 +1,8 @@
 import asyncio
 import logging
+import re
 import time
+import unicodedata
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -108,11 +110,50 @@ async def product_suggestions(query: str = Query(..., min_length=2, max_length=8
     return await get_product_suggestions(query.strip())
 
 
+# --- Kontrola relevance obrázků --------------------------------------------
+
+def normalize_str(s: str) -> str:
+    """Odstraní diakritiku a převede na malá písmena pro porovnání."""
+    if not s:
+        return ""
+    s = unicodedata.normalize('NFD', s)
+    s = ''.join(c for c in s if unicodedata.category(c) != 'Mn')
+    return s.lower()
+
+
+def is_product_match(query: str, off_product_name: str) -> bool:
+    """
+    Striktoní overení, zda nalezený OFF produkt odpovídá hledanému zboží.
+    Pokud neodpovídá, obrázek se zamítne a raději se zobrazí placeholder.
+    """
+    if not off_product_name:
+        return False
+
+    q_norm = normalize_str(query)
+    p_norm = normalize_str(off_product_name)
+
+    # Nepovolená slova: Pokud NOHLEDÁME tyčinku/krekry, ale OFF je vrátí, odmítnout!
+    mismatch_keywords = ["tycinka", "snack", "krekr", "cracker", "chips", "protein bar"]
+    for kw in mismatch_keywords:
+        if kw in p_norm and kw not in q_norm:
+            logger.info(f"🚫 [Zamítnuto] OFF vrátil '{off_product_name}' (obsahuje '{kw}'), ale hledáme '{query}'")
+            return False
+
+    # Ověření, že alespoň klíčové slovo (např. 'tvaroh', 'paprika', 'vejce') je v názvu
+    words = [w for w in q_norm.split() if len(w) > 2 and w not in ["bio", "albert", "madeta", "olma", "milko", "billa", "lidl", "pilos"]]
+    if words:
+        main_word = words[0]
+        if main_word not in p_norm:
+            logger.info(f"🚫 [Zamítnuto] Slovo '{main_word}' nenalezeno v náhledu OFF '{off_product_name}'")
+            return False
+
+    return True
+
+
 # --- Open Food Facts image proxy -------------------------------------------
 _off_request_lock = asyncio.Lock()
 _off_last_request_at = 0.0
-_OFF_MIN_INTERVAL_SECONDS = 1.0
-
+_OFF_MIN_INTERVAL_SECONDS = 0.5
 _OFF_USER_AGENT = "MujAkcniLetak/1.0 (personal project; contact: replace-with-your-email@example.com)"
 
 
@@ -123,7 +164,6 @@ async def _throttled_off_get(client: httpx.AsyncClient, url: str, params: dict) 
         async with _off_request_lock:
             wait = _OFF_MIN_INTERVAL_SECONDS - (time.monotonic() - _off_last_request_at)
             if wait > 0:
-                logger.debug(f"Čekám {wait:.2f}s před dalším dotazem na OFF...")
                 await asyncio.sleep(wait)
             _off_last_request_at = time.monotonic()
             return await client.get(url, params=params)
@@ -137,23 +177,19 @@ async def proxy_image(
     code: str | None = Query(None, min_length=8, max_length=32),
 ) -> dict:
     search_label = query or code or "neznámý"
-    logger.info(f"🖼️ [ProxyImage] Požadavek na obrázek: '{search_label}'")
 
     try:
         normalized_query = " ".join(query.split()) if query else None
         normalized_code = "".join(code.split()) if code else None
         if not normalized_code and not normalized_query:
-            logger.warning("⚠️ [ProxyImage] Zaznamenán dotaz bez 'query' i 'code'")
             return {"image_url": None}
 
+        # Unikátní klíč do cache
         cache_key = f"ean:{normalized_code}" if normalized_code else f"name:{(normalized_query or '').lower()}"
         cached_image_url = get_cached_image_url(cache_key)
 
         if cached_image_url is not None:
-            logger.info(f"⚡ [ProxyImage] Cache hit pro '{search_label}' -> {cached_image_url or 'Nenalezeno (Cached)'}")
             return {"image_url": cached_image_url or None}
-
-        logger.info(f"🌐 [ProxyImage] Cache miss, volám Open Food Facts pro '{search_label}'")
 
         if normalized_code:
             target_url = "https://world.openfoodfacts.org/api/v2/search"
@@ -168,36 +204,41 @@ async def proxy_image(
                 "search_simple": "1",
                 "action": "process",
                 "json": "1",
-                "page_size": "1",
+                "page_size": "5",
                 "fields": "product_name,image_front_url,image_url",
             }
 
         headers = {"User-Agent": _OFF_USER_AGENT}
-        async with httpx.AsyncClient(timeout=5.0, headers=headers) as client:
+        async with httpx.AsyncClient(timeout=4.0, headers=headers) as client:
             response = await _throttled_off_get(client, target_url, request_params)
 
             if response.status_code != 200:
-                logger.warning(f"⚠️ [ProxyImage] OFF vrátil status {response.status_code} pro '{search_label}'")
                 store_cached_image_url(cache_key, normalized_query or normalized_code or "", None)
                 return {"image_url": None}
 
             payload = response.json()
 
         products = payload.get("products") or []
-        product = next((item for item in products if item.get("image_front_url") or item.get("image_url")), None)
-        image_url = (product.get("image_front_url") or product.get("image_url")) if product else None
+        
+        # Procházíme výsledky a vybereme POUZE ten, který odpovídá hledanému produktu
+        matched_image_url = None
+        for prod in products:
+            pname = prod.get("product_name", "")
+            img = prod.get("image_front_url") or prod.get("image_url")
+            
+            if img and (normalized_code or is_product_match(normalized_query or "", pname)):
+                logger.info(f"✅ [Správná shoda] '{search_label}' -> Nalezen OFF produkt: '{pname}'")
+                matched_image_url = img
+                break
 
-        logger.info(f"✅ [ProxyImage] Obrázek získej pro '{search_label}' -> {image_url or 'Nenalezeno'}")
-        store_cached_image_url(cache_key, normalized_query or normalized_code or "", image_url)
-        return {"image_url": image_url}
+        if not matched_image_url:
+            logger.info(f"ℹ️ [Žádný odpovídající obrázek] Pro '{search_label}' zobrazuji náhradní kartu.")
 
-    except asyncio.TimeoutError:
-        logger.warning(f"⏱️ [ProxyImage] Vypršel časový limit (Timeout) pro '{search_label}'")
-        return {"image_url": None}
+        store_cached_image_url(cache_key, normalized_query or normalized_code or "", matched_image_url)
+        return {"image_url": matched_image_url}
 
     except Exception as exc:
-        # Zaznamená celou chybovou výjimku (Stack trace) do konzole
-        logger.error(f"❌ [ProxyImage] Neočekávaná chyba u '{search_label}': {exc}", exc_info=True)
+        logger.error(f"❌ [Chyba proxy-image] '{search_label}': {exc}")
         return {"image_url": None}
 
 
