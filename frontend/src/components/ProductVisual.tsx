@@ -18,6 +18,7 @@ function canRequestAgain(cacheKey: string) {
   const now = Date.now();
   const lastRequest = requestCooldown.get(cacheKey) ?? 0;
   if (now - lastRequest < 15000) {
+    console.log(`⏱️ [FE Cooldown] Pro klíč '${cacheKey}' platí 15s cooldown (uběhlo ${now - lastRequest} ms). Vynechávám.`);
     return false;
   }
   requestCooldown.set(cacheKey, now);
@@ -39,18 +40,6 @@ function lookupVisualQuery(visualKey: string | null | undefined) {
   return VISUAL_SOURCES[visualKey]?.remoteQuery ?? null;
 }
 
-// Ordered, de-duplicated search terms to try against the backend image
-// proxy: the specific scraped product name first (best match when it
-// hits), then the raw tracked keyword, then - as a last resort - the
-// broad category term from visuals.ts (e.g. "chicken meat" instead of
-// "Kuřecí prsní řízky Vodňanské kuře 500g"). Specific Czech branded
-// product names very often have no match in Open Food Facts at all, so
-// falling back to a broad category term meaningfully increases the odds
-// of getting *some* representative photo instead of a plain placeholder.
-// This costs at most 2 extra backend requests per product, and only for
-// products that miss on the first try - and thanks to the fixed negative
-// caching in image_cache.py, that's a one-time cost per product name, not
-// a recurring one.
 function resolveImageQueries(productName: string | null, tag: string, visualKey: string | null | undefined) {
   const candidates = [normalizeQuery(productName), normalizeQuery(tag), lookupVisualQuery(visualKey)];
   const seen = new Set<string>();
@@ -75,16 +64,6 @@ function Placeholder({ label, sizeClass }: { label: string; sizeClass: string })
   );
 }
 
-// NOTE: `ean` is currently always undefined in practice. kupiapi's raw
-// scraper output (backend/app/kupi_service.py) only ever contains name /
-// shops / prices / amounts / validities - no barcode field exists
-// anywhere in the library (checked directly against its source, both the
-// published PyPI package and the current GitHub main branch), and
-// backend/app/schemas.py's Offer model has no `ean` field either. So this
-// function never actually fires a request today - it's kept because it's
-// harmless and free to leave in if EAN scraping is ever added upstream.
-// If you don't plan to add that, you can delete this function, the `ean`
-// prop, and its call site below without losing anything that currently works.
 async function fetchProductImageByEan(ean: string | null | undefined, fallbackUrl: string | null) {
   if (isValidImageUrl(fallbackUrl)) {
     return fallbackUrl;
@@ -97,15 +76,20 @@ async function fetchProductImageByEan(ean: string | null | undefined, fallbackUr
 
   const cacheKey = `ean:${normalizedEan}`;
   if (imageCache.has(cacheKey)) {
+    console.log(`⚡ [FE Cache HIT] Našel jsem v paměti JS pro EAN: '${cacheKey}'`);
     return imageCache.get(cacheKey)!;
   }
 
   const request = (async () => {
     try {
-      // ⏱ Rozprostření dotazů až na 5 vteřin
-      await new Promise((resolve) => setTimeout(resolve, Math.random() * 5000));
+      const delay = Math.random() * 5000;
+      console.log(`⏳ [FE Jitter] Rozprostírám dotaz pro EAN '${normalizedEan}' o ${(delay / 1000).toFixed(2)}s`);
+      await new Promise((resolve) => setTimeout(resolve, delay));
 
-      const response = await fetch(`${API_BASE_URL}/api/proxy-image?code=${encodeURIComponent(normalizedEan)}`);
+      const url = `${API_BASE_URL}/api/proxy-image?code=${encodeURIComponent(normalizedEan)}`;
+      console.log(`🌐 [FE 2/4] Volám backend EAN proxy -> ${url}`);
+
+      const response = await fetch(url);
 
       if (!response.ok) {
         if (response.status === 429) {
@@ -120,9 +104,10 @@ async function fetchProductImageByEan(ean: string | null | undefined, fallbackUr
         return null;
       }
 
-      // Podpora obou formátů (camelCase i snake_case) pro jistotu
       const data = JSON.parse(rawText) as { image_url?: string | null; imageUrl?: string | null };
-      return data.imageUrl ?? data.image_url ?? null;
+      const result = data.imageUrl ?? data.image_url ?? null;
+      console.log(`📥 [FE 3/4] Výsledek pro EAN '${normalizedEan}':`, result);
+      return result;
     } catch {
       return null;
     }
@@ -149,6 +134,7 @@ async function fetchProductImageByName(productName: string | null, fallbackUrl: 
 
   const cacheKey = `name:${query.toLowerCase()}`;
   if (imageCache.has(cacheKey)) {
+    console.log(`⚡ [FE Cache HIT] Našel jsem v paměti JS pro Name: '${cacheKey}'`);
     return imageCache.get(cacheKey)!;
   }
 
@@ -158,10 +144,14 @@ async function fetchProductImageByName(productName: string | null, fallbackUrl: 
 
   const request = (async () => {
     try {
-      // ⏱ Rozprostření dotazů až na 5 vteřin
-      await new Promise((resolve) => setTimeout(resolve, Math.random() * 5000));
+      const delay = Math.random() * 5000;
+      console.log(`⏳ [FE Jitter] Rozprostírám dotaz pro '${query}' o ${(delay / 1000).toFixed(2)}s`);
+      await new Promise((resolve) => setTimeout(resolve, delay));
 
-      const response = await fetch(`${API_BASE_URL}/api/proxy-image?query=${encodeURIComponent(query)}`);
+      const url = `${API_BASE_URL}/api/proxy-image?query=${encodeURIComponent(query)}`;
+      console.log(`🌐 [FE 2/4] Volám backend Name proxy -> ${url}`);
+
+      const response = await fetch(url);
 
       if (!response.ok) {
         if (response.status === 429) {
@@ -170,9 +160,10 @@ async function fetchProductImageByName(productName: string | null, fallbackUrl: 
         return null;
       }
 
-      // Podpora obou formátů (camelCase i snake_case) pro jistotu
       const data = (await response.json()) as { image_url?: string | null; imageUrl?: string | null };
-      return data.imageUrl ?? data.image_url ?? null;
+      const result = data.imageUrl ?? data.image_url ?? null;
+      console.log(`📥 [FE 3/4] Výsledek pro název '${query}':`, result);
+      return result;
     } catch (error) {
       console.error("❌ Chyba při stahování přes backend proxy:", error);
       return null;
@@ -203,18 +194,26 @@ export function ProductVisual({ imageUrl, tag, visualKey, ean, productName, size
     setIsFetching(!isValidImageUrl(nextImage));
 
     if (isValidImageUrl(nextImage)) {
+      console.log(`✅ [FE FastPath] Produkt '${productName ?? tag}' již má platnou URL ze skrapování: ${nextImage}`);
       return () => {
         isActive = false;
       };
     }
 
+    const queries = resolveImageQueries(productName, tag, visualKey);
+    console.log(`🔍 [FE 1/4] ProductVisual init pro '${productName ?? tag}'. Seznam vyřešených kandidátů:`, queries);
+
     void (async () => {
       let image = await fetchProductImageByEan(ean, nextImage);
 
       if (!image) {
-        for (const query of resolveImageQueries(productName, tag, visualKey)) {
+        for (const query of queries) {
+          console.log(`👉 [FE Step] Zkouším candidate query: '${query}'`);
           image = await fetchProductImageByName(query, nextImage);
-          if (image) break;
+          if (image) {
+            console.log(`🎯 [FE Match] Nalezen obrázek pro kandidáta '${query}' -> ${image}`);
+            break;
+          }
         }
       }
 
@@ -222,6 +221,7 @@ export function ProductVisual({ imageUrl, tag, visualKey, ean, productName, size
         return;
       }
 
+      console.log(`🏁 [FE 4/4] Konečný stav pro '${productName ?? tag}':`, image ? `Obrázek ${image}` : "Zobrazuji Placeholder");
       setResolvedImage(image ?? null);
       setIsFetching(false);
     })();
@@ -242,7 +242,10 @@ export function ProductVisual({ imageUrl, tag, visualKey, ean, productName, size
       alt={productName ?? tag}
       loading="lazy"
       referrerPolicy="no-referrer"
-      onError={() => setImageFailed(true)}
+      onError={() => {
+        console.warn(`❌ [FE Img Error] Obrázek selhal při načítání v prohlížeči (404/CORS): ${resolvedImage}`);
+        setImageFailed(true);
+      }}
       className={`${sizeClass} shrink-0 rounded-lg bg-stone-100 object-cover`}
     />
   );

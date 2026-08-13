@@ -24,7 +24,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-logger = logging.getLogger("akcni_letak")
+logger = logging.getLogger("akcni_letak.proxy")
 
 app = FastAPI(title="Muj akcni letak API")
 
@@ -110,10 +110,35 @@ async def product_suggestions(query: str = Query(..., min_length=2, max_length=8
     return await get_product_suggestions(query.strip())
 
 
-# --- Kontrola relevance obrázků --------------------------------------------
+# --- Čištění a validace dotazů pro vyhledávání obrázků --------------------
+
+def clean_search_query(query: str) -> str:
+    """Odstraní z názvu akčního letáku názvy supermarketů, značky a balení."""
+    if not query:
+        return ""
+
+    q = query.lower()
+    stop_words = [
+        "albertovo uzenářství", "albertovo uzenarstvi", "kostelecké uzeniny", "kostelecke uzeniny",
+        "řezníkův talíř", "reznikov talir", "reznikuv talir", "srdce domova", "jihočeský", "jihocesky",
+        "nature's promise", "natures promise", "billa bonvia", "karlova koruna", "česká farma", "ceska farma",
+        "jaroměřický", "jaromericky", "delikátní", "delikatni", "yes plants", "grill party",
+        "madeta", "olma", "milko", "albert", "billa", "penny", "lidl", "pilos", "pikok", "le&co", "le & co",
+        "idema", "president", "kupi", "dětská", "detska",
+        "nejvyšší jakosti", "nejvyssi jakosti", "výběrová", "vyberova", "standard", "poctivá", "poctiva",
+        "z podestýlky", "z podestylky", "z poděbrad", "z podebrad", "od kosti", "na rohlik", "na rohlík",
+        "akce", "sleva", "balení", "baleni"
+    ]
+
+    for word in stop_words:
+        q = q.replace(word, " ")
+
+    q = re.sub(r'\b[a-z0-9]\b', ' ', q)
+    cleaned = " ".join(q.split())
+    return cleaned if len(cleaned) >= 2 else query
+
 
 def normalize_str(s: str) -> str:
-    """Odstraní diakritiku a převede na malá písmena pro porovnání."""
     if not s:
         return ""
     s = unicodedata.normalize('NFD', s)
@@ -121,32 +146,28 @@ def normalize_str(s: str) -> str:
     return s.lower()
 
 
-def is_product_match(query: str, off_product_name: str) -> bool:
-    """
-    Striktoní overení, zda nalezený OFF produkt odpovídá hledanému zboží.
-    Pokud neodpovídá, obrázek se zamítne a raději se zobrazí placeholder.
-    """
-    if not off_product_name:
+def is_relevant_product(query: str, product_name: str) -> bool:
+    """Ověří, zda nalezený produkt v OFF odpovídá hledanému zboží."""
+    if not product_name:
         return False
 
     q_norm = normalize_str(query)
-    p_norm = normalize_str(off_product_name)
+    p_norm = normalize_str(product_name)
 
-    # Nepovolená slova: Pokud NOHLEDÁME tyčinku/krekry, ale OFF je vrátí, odmítnout!
     mismatch_keywords = ["tycinka", "snack", "krekr", "cracker", "chips", "protein bar"]
-    for kw in mismatch_keywords:
-        if kw in p_norm and kw not in q_norm:
-            logger.info(f"🚫 [Zamítnuto] OFF vrátil '{off_product_name}' (obsahuje '{kw}'), ale hledáme '{query}'")
+    for bad in mismatch_keywords:
+        if bad in p_norm and bad not in q_norm:
+            logger.info(f"  └─ ❌ [BE 5/6 Filter] Produkt '{product_name}' zamítnut (obsahuje zákeřné slovo '{bad}')")
             return False
 
-    # Ověření, že alespoň klíčové slovo (např. 'tvaroh', 'paprika', 'vejce') je v názvu
-    words = [w for w in q_norm.split() if len(w) > 2 and w not in ["bio", "albert", "madeta", "olma", "milko", "billa", "lidl", "pilos"]]
-    if words:
-        main_word = words[0]
-        if main_word not in p_norm:
-            logger.info(f"🚫 [Zamítnuto] Slovo '{main_word}' nenalezeno v náhledu OFF '{off_product_name}'")
+    q_words = [w for w in q_norm.split() if len(w) >= 3]
+    if q_words:
+        has_match = any(w in p_norm for w in q_words)
+        if not has_match:
+            logger.info(f"  └─ ❌ [BE 5/6 Filter] Produkt '{product_name}' zamítnut (žádné ze slov {q_words} nebylo v názvu)")
             return False
 
+    logger.info(f"  └─ ✅ [BE 5/6 Filter] Produkt '{product_name}' schválen jako relevantní!")
     return True
 
 
@@ -164,6 +185,7 @@ async def _throttled_off_get(client: httpx.AsyncClient, url: str, params: dict) 
         async with _off_request_lock:
             wait = _OFF_MIN_INTERVAL_SECONDS - (time.monotonic() - _off_last_request_at)
             if wait > 0:
+                logger.debug(f"⏳ [Throttling] Čekám {wait:.2f}s před odesláním na OFF...")
                 await asyncio.sleep(wait)
             _off_last_request_at = time.monotonic()
             return await client.get(url, params=params)
@@ -171,74 +193,100 @@ async def _throttled_off_get(client: httpx.AsyncClient, url: str, params: dict) 
     return await asyncio.wait_for(_acquire_and_fetch(), timeout=4.0)
 
 
+async def fetch_off_image(client: httpx.AsyncClient, search_term: str, original_query: str) -> str | None:
+    target_url = "https://world.openfoodfacts.org/cgi/search.pl"
+    request_params = {
+        "search_terms": search_term,
+        "search_simple": "1",
+        "action": "process",
+        "json": "1",
+        "page_size": "5",
+        "fields": "product_name,image_front_url,image_url",
+    }
+
+    try:
+        logger.info(f"📡 [BE 4/6 OFF Fetch] Odesílám GET na Open Food Facts pro termín: '{search_term}'")
+        response = await _throttled_off_get(client, target_url, request_params)
+
+        if response.status_code != 200:
+            logger.warning(f"⚠️ [BE 4/6 OFF Fetch] Open Food Facts vrátil status {response.status_code}")
+            return None
+
+        payload = response.json()
+        products = payload.get("products") or []
+        logger.info(f"📦 [BE 4/6 OFF Fetch] Vracím {len(products)} kandidátů z OFF pro '{search_term}'")
+
+        for index, prod in enumerate(products, 1):
+            pname = prod.get("product_name", "Bez názvu")
+            img = prod.get("image_front_url") or prod.get("image_url")
+            logger.info(f"  ├─ Kandidát #{index}: '{pname}' (Image: {'Ano' if img else 'Ne'})")
+
+            if img and is_relevant_product(original_query, pname):
+                return img
+
+    except Exception as exc:
+        logger.warning(f"⚠️ [BE 4/6 OFF Fetch] Výjimka při stahování pro '{search_term}': {exc}")
+
+    return None
+
+
 @app.get("/api/proxy-image")
 async def proxy_image(
     query: str | None = Query(None, min_length=2, max_length=120),
     code: str | None = Query(None, min_length=8, max_length=32),
 ) -> dict:
+    start_time = time.monotonic()
     search_label = query or code or "neznámý"
+    logger.info(f"🚀 [BE 1/6 Endpoint] PŘIJAT POŽADAVEK -> Query: '{query}', Code: '{code}'")
 
     try:
         normalized_query = " ".join(query.split()) if query else None
         normalized_code = "".join(code.split()) if code else None
+
         if not normalized_code and not normalized_query:
+            logger.warning("⚠️ [BE 1/6 Endpoint] Prázdný požadavek bez query/code")
             return {"image_url": None}
 
-        # Unikátní klíč do cache
         cache_key = f"ean:{normalized_code}" if normalized_code else f"name:{(normalized_query or '').lower()}"
+        logger.info(f"🔑 [BE 2/6 Cache Check] Generuji cache_key: '{cache_key}'")
+
         cached_image_url = get_cached_image_url(cache_key)
 
         if cached_image_url is not None:
-            return {"image_url": cached_image_url or None}
-
-        if normalized_code:
-            target_url = "https://world.openfoodfacts.org/api/v2/search"
-            request_params = {
-                "code": normalized_code,
-                "fields": "product_name,image_front_url,image_url",
-            }
-        else:
-            target_url = "https://world.openfoodfacts.org/cgi/search.pl"
-            request_params = {
-                "search_terms": normalized_query,
-                "search_simple": "1",
-                "action": "process",
-                "json": "1",
-                "page_size": "5",
-                "fields": "product_name,image_front_url,image_url",
-            }
-
-        headers = {"User-Agent": _OFF_USER_AGENT}
-        async with httpx.AsyncClient(timeout=4.0, headers=headers) as client:
-            response = await _throttled_off_get(client, target_url, request_params)
-
-            if response.status_code != 200:
-                store_cached_image_url(cache_key, normalized_query or normalized_code or "", None)
+            elapsed = round((time.monotonic() - start_time) * 1000)
+            if cached_image_url != "":
+                logger.info(f"⚡ [BE 2/6 Cache HIT] Vráceno z databáze za {elapsed} ms -> '{cached_image_url}'")
+                return {"image_url": cached_image_url}
+            else:
+                logger.info(f"🛡️ [BE 2/6 Cache FRESH NEGATIVE] V databázi je čerstvý negativní záznam. Vráceno za {elapsed} ms -> None")
                 return {"image_url": None}
 
-            payload = response.json()
+        cleaned_query = clean_search_query(normalized_query) if normalized_query else None
+        logger.info(f"🧹 [BE 3/6 Clean] Původní: '{normalized_query}' -> Vyčištěno: '{cleaned_query}'")
 
-        products = payload.get("products") or []
-        
-        # Procházíme výsledky a vybereme POUZE ten, který odpovídá hledanému produktu
+        headers = {"User-Agent": _OFF_USER_AGENT}
         matched_image_url = None
-        for prod in products:
-            pname = prod.get("product_name", "")
-            img = prod.get("image_front_url") or prod.get("image_url")
-            
-            if img and (normalized_code or is_product_match(normalized_query or "", pname)):
-                logger.info(f"✅ [Správná shoda] '{search_label}' -> Nalezen OFF produkt: '{pname}'")
-                matched_image_url = img
-                break
 
-        if not matched_image_url:
-            logger.info(f"ℹ️ [Žádný odpovídající obrázek] Pro '{search_label}' zobrazuji náhradní kartu.")
+        async with httpx.AsyncClient(timeout=4.0, headers=headers) as client:
+            # 1. Pokus: Hledání podle vyčištěného názvu
+            if cleaned_query:
+                matched_image_url = await fetch_off_image(client, cleaned_query, normalized_query or "")
 
+            # 2. Záložní pokus: Hledání podle prvního hlavního slova
+            if not matched_image_url and cleaned_query:
+                first_word = cleaned_query.split()[0]
+                if len(first_word) >= 3 and first_word != cleaned_query:
+                    logger.info(f"🔄 [BE 4/6 Fallback] Zkouším náhradní vyhledávání pouze pro slovo '{first_word}'")
+                    matched_image_url = await fetch_off_image(client, first_word, normalized_query or "")
+
+        elapsed = round((time.monotonic() - start_time) * 1000)
+        logger.info(f"💾 [BE 6/6 Store & Return] Hotovo za {elapsed} ms. Výsledek '{matched_image_url or 'NULL'}' uložím do keše.")
         store_cached_image_url(cache_key, normalized_query or normalized_code or "", matched_image_url)
+
         return {"image_url": matched_image_url}
 
     except Exception as exc:
-        logger.error(f"❌ [Chyba proxy-image] '{search_label}': {exc}")
+        logger.error(f"❌ [BE ERROR] Chyba proxy_image pro '{search_label}': {exc}", exc_info=True)
         return {"image_url": None}
 
 
