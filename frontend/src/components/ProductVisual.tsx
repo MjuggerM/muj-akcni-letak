@@ -11,19 +11,8 @@ interface ProductVisualProps {
   size?: "card" | "hit";
 }
 
+// Paměťový cache v JS pro sdílení dotazů mezi všemi kartami na stránce
 const imageCache = new Map<string, Promise<string | null>>();
-const requestCooldown = new Map<string, number>();
-
-function canRequestAgain(cacheKey: string) {
-  const now = Date.now();
-  const lastRequest = requestCooldown.get(cacheKey) ?? 0;
-  if (now - lastRequest < 15000) {
-    console.log(`⏱️ [FE Cooldown] Pro klíč '${cacheKey}' platí 15s cooldown (uběhlo ${now - lastRequest} ms). Vynechávám.`);
-    return false;
-  }
-  requestCooldown.set(cacheKey, now);
-  return true;
-}
 
 function isValidImageUrl(value: string | null | undefined) {
   return Boolean(value && /^https?:\/\//i.test(value));
@@ -76,25 +65,21 @@ async function fetchProductImageByEan(ean: string | null | undefined, fallbackUr
 
   const cacheKey = `ean:${normalizedEan}`;
   if (imageCache.has(cacheKey)) {
-    console.log(`⚡ [FE Cache HIT] Našel jsem v paměti JS pro EAN: '${cacheKey}'`);
+    console.log(`⚡ [FE Cache HIT] Sdílený požadavek v paměti pro EAN: '${cacheKey}'`);
     return imageCache.get(cacheKey)!;
   }
 
   const request = (async () => {
     try {
-      const delay = Math.random() * 5000;
-      console.log(`⏳ [FE Jitter] Rozprostírám dotaz pro EAN '${normalizedEan}' o ${(delay / 1000).toFixed(2)}s`);
+      const delay = Math.random() * 2000;
       await new Promise((resolve) => setTimeout(resolve, delay));
 
       const url = `${API_BASE_URL}/api/proxy-image?code=${encodeURIComponent(normalizedEan)}`;
-      console.log(`🌐 [FE 2/4] Volám backend EAN proxy -> ${url}`);
+      console.log(`🌐 [FE 2/4] Volám EAN proxy -> ${url}`);
 
       const response = await fetch(url);
 
       if (!response.ok) {
-        if (response.status === 429) {
-          console.error("❌ API nás zablokovalo (Rate Limit) pro EAN:", normalizedEan);
-        }
         return null;
       }
 
@@ -105,20 +90,13 @@ async function fetchProductImageByEan(ean: string | null | undefined, fallbackUr
       }
 
       const data = JSON.parse(rawText) as { image_url?: string | null; imageUrl?: string | null };
-      const result = data.imageUrl ?? data.image_url ?? null;
-      console.log(`📥 [FE 3/4] Výsledek pro EAN '${normalizedEan}':`, result);
-      return result;
+      return data.imageUrl ?? data.image_url ?? null;
     } catch {
       return null;
     }
   })();
 
   imageCache.set(cacheKey, request);
-
-  request.then((res) => {
-    if (!res) imageCache.delete(cacheKey);
-  }).catch(() => imageCache.delete(cacheKey));
-
   return request;
 }
 
@@ -133,36 +111,30 @@ async function fetchProductImageByName(productName: string | null, fallbackUrl: 
   }
 
   const cacheKey = `name:${query.toLowerCase()}`;
+  
+  // Pokud jakákoliv jiná karta už tento dotaz posílá nebo poslala, okamžitě použijeme její Promise
   if (imageCache.has(cacheKey)) {
-    console.log(`⚡ [FE Cache HIT] Našel jsem v paměti JS pro Name: '${cacheKey}'`);
+    console.log(`⚡ [FE Cache HIT] Znovupoužívám sdílený dotaz pro: '${cacheKey}'`);
     return imageCache.get(cacheKey)!;
-  }
-
-  if (!canRequestAgain(cacheKey)) {
-    return null;
   }
 
   const request = (async () => {
     try {
-      const delay = Math.random() * 5000;
-      console.log(`⏳ [FE Jitter] Rozprostírám dotaz pro '${query}' o ${(delay / 1000).toFixed(2)}s`);
+      const delay = Math.random() * 1500;
       await new Promise((resolve) => setTimeout(resolve, delay));
 
       const url = `${API_BASE_URL}/api/proxy-image?query=${encodeURIComponent(query)}`;
-      console.log(`🌐 [FE 2/4] Volám backend Name proxy -> ${url}`);
+      console.log(`🌐 [FE 2/4] Volám Name proxy -> ${url}`);
 
       const response = await fetch(url);
 
       if (!response.ok) {
-        if (response.status === 429) {
-          console.error("❌ API nás zablokovalo (Rate Limit) pro název:", query);
-        }
         return null;
       }
 
       const data = (await response.json()) as { image_url?: string | null; imageUrl?: string | null };
       const result = data.imageUrl ?? data.image_url ?? null;
-      console.log(`📥 [FE 3/4] Výsledek pro název '${query}':`, result);
+      console.log(`📥 [FE 3/4] Odpověď pro název '${query}':`, result);
       return result;
     } catch (error) {
       console.error("❌ Chyba při stahování přes backend proxy:", error);
@@ -170,12 +142,8 @@ async function fetchProductImageByName(productName: string | null, fallbackUrl: 
     }
   })();
 
+  // Uložíme Promise do paměti ještě PŘED vyřízením, aby všechny paralelní karty sdílely stejný fetch
   imageCache.set(cacheKey, request);
-
-  request.then((res) => {
-    if (!res) imageCache.delete(cacheKey);
-  }).catch(() => imageCache.delete(cacheKey));
-
   return request;
 }
 
@@ -194,26 +162,20 @@ export function ProductVisual({ imageUrl, tag, visualKey, ean, productName, size
     setIsFetching(!isValidImageUrl(nextImage));
 
     if (isValidImageUrl(nextImage)) {
-      console.log(`✅ [FE FastPath] Produkt '${productName ?? tag}' již má platnou URL ze skrapování: ${nextImage}`);
       return () => {
         isActive = false;
       };
     }
 
     const queries = resolveImageQueries(productName, tag, visualKey);
-    console.log(`🔍 [FE 1/4] ProductVisual init pro '${productName ?? tag}'. Seznam vyřešených kandidátů:`, queries);
 
     void (async () => {
       let image = await fetchProductImageByEan(ean, nextImage);
 
       if (!image) {
         for (const query of queries) {
-          console.log(`👉 [FE Step] Zkouším candidate query: '${query}'`);
           image = await fetchProductImageByName(query, nextImage);
-          if (image) {
-            console.log(`🎯 [FE Match] Nalezen obrázek pro kandidáta '${query}' -> ${image}`);
-            break;
-          }
+          if (image) break;
         }
       }
 
@@ -221,7 +183,6 @@ export function ProductVisual({ imageUrl, tag, visualKey, ean, productName, size
         return;
       }
 
-      console.log(`🏁 [FE 4/4] Konečný stav pro '${productName ?? tag}':`, image ? `Obrázek ${image}` : "Zobrazuji Placeholder");
       setResolvedImage(image ?? null);
       setIsFetching(false);
     })();
@@ -242,10 +203,7 @@ export function ProductVisual({ imageUrl, tag, visualKey, ean, productName, size
       alt={productName ?? tag}
       loading="lazy"
       referrerPolicy="no-referrer"
-      onError={() => {
-        console.warn(`❌ [FE Img Error] Obrázek selhal při načítání v prohlížeči (404/CORS): ${resolvedImage}`);
-        setImageFailed(true);
-      }}
+      onError={() => setImageFailed(true)}
       className={`${sizeClass} shrink-0 rounded-lg bg-stone-100 object-cover`}
     />
   );

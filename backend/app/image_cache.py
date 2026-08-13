@@ -10,7 +10,6 @@ from .config import IMAGE_NEGATIVE_CACHE_TTL_DAYS
 logger = logging.getLogger("akcni_letak.cache")
 
 CACHE_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "image_cache.sqlite3"
-
 NEGATIVE_CACHE_TTL = timedelta(days=IMAGE_NEGATIVE_CACHE_TTL_DAYS)
 
 
@@ -31,17 +30,26 @@ def _connection() -> sqlite3.Connection:
     return connection
 
 
+def clear_empty_negative_cache() -> None:
+    """Smaže z databáze staré prázdné záznamy, aby se mohly obrázky znovu načíst."""
+    try:
+        with _connection() as conn:
+            conn.execute("DELETE FROM product_image_cache WHERE image_url = '' OR image_url IS NULL")
+            conn.commit()
+            logger.info("🧹 [BE Cache Reset] Vyčištěny staré prázdné záznamy z databáze keše.")
+    except Exception as exc:
+        logger.error(f"❌ [BE Cache Reset Error]: {exc}")
+
+
 def get_cached_image_url(cache_key: str) -> str | None:
     """
     Look up a previously cached image lookup.
 
     Returns:
       - None  -> this key has never been looked up (caller should query the API)
-      - ""    -> looked up before, confirmed NO image, and that result is
-                 still fresh (caller should NOT query the API again)
+      - ""    -> looked up before, confirmed NO image, and that result is still fresh
       - a URL -> a previously found image
     """
-    logger.debug(f"💾 [BE Cache Query] Dotaz na SQLite (product_image_cache) pro klíč: '{cache_key}'")
     try:
         with _connection() as connection:
             row = connection.execute(
@@ -61,14 +69,13 @@ def get_cached_image_url(cache_key: str) -> str | None:
         try:
             cached_at = datetime.fromisoformat(updated_at).replace(tzinfo=timezone.utc)
         except ValueError:
-            logger.warning(f"⚠️ [BE Cache Timestamp Error] Neplatný formát datumu pro '{cache_key}'. Vyprší ihned.")
             return None
 
         if datetime.now(timezone.utc) - cached_at > NEGATIVE_CACHE_TTL:
-            logger.info(f"⏳ [BE Cache STALE NEGATIVE] Negativní záznam pro '{cache_key}' je starší než {IMAGE_NEGATIVE_CACHE_TTL_DAYS} dní. Bude se hledat znovu.")
+            logger.info(f"⏳ [BE Cache STALE] Negativní záznam pro '{cache_key}' vypršel.")
             return None
 
-        logger.info(f"🛡️ [BE Cache FRESH NEGATIVE] Potvrzeno 'BEZ OBRÁZKU' pro '{cache_key}'. Čerstvý záznam z {updated_at}. OFF nevolám.")
+        logger.info(f"🛡️ [BE Cache FRESH NEGATIVE] Potvrzeno 'BEZ OBRÁZKU' pro '{cache_key}'. OFF nevolám.")
         return ""
 
     except Exception as exc:
@@ -78,7 +85,7 @@ def get_cached_image_url(cache_key: str) -> str | None:
 
 def store_cached_image_url(cache_key: str, query: str, image_url: str | None, source: str = "openfoodfacts") -> None:
     saved_value = image_url or ""
-    logger.info(f"💾 [BE Cache STORE] Zapisuji do product_image_cache klíč: '{cache_key}' -> '{saved_value or '"" (EMPTY)'}'")
+    logger.info(f"💾 [BE Cache STORE] Zapisuji do SQLite klíč: '{cache_key}' -> '{saved_value or 'EMPTY'}'")
     try:
         with _connection() as connection:
             connection.execute(
