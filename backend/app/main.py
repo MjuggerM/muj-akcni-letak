@@ -28,7 +28,7 @@ logger = logging.getLogger("akcni_letak.proxy")
 
 app = FastAPI(title="Muj akcni letak API")
 
-# Při startu backendu promažeme staré prázdné záznamy, které vznikly předchozím timeoutem
+# Při startu zlikvidujeme veškerou starou 'negative cache', která doteď blokovala načítání
 clear_empty_negative_cache()
 
 app.add_middleware(
@@ -116,7 +116,6 @@ async def product_suggestions(query: str = Query(..., min_length=2, max_length=8
 # --- Čištění a validace dotazů pro vyhledávání obrázků --------------------
 
 def clean_search_query(query: str) -> str:
-    """Odstraní z názvu akčního letáku názvy supermarketů, značky a balení."""
     if not query:
         return ""
 
@@ -150,7 +149,6 @@ def normalize_str(s: str) -> str:
 
 
 def is_relevant_product(query: str, product_name: str) -> bool:
-    """Ověří, zda nalezený produkt v OFF odpovídá hledanému zboží."""
     if not product_name:
         return False
 
@@ -160,17 +158,14 @@ def is_relevant_product(query: str, product_name: str) -> bool:
     mismatch_keywords = ["tycinka", "snack", "krekr", "cracker", "chips", "protein bar"]
     for bad in mismatch_keywords:
         if bad in p_norm and bad not in q_norm:
-            logger.info(f"  └─ ❌ [BE Filter] Produkt '{product_name}' zamítnut (obsahuje '{bad}')")
             return False
 
     q_words = [w for w in q_norm.split() if len(w) >= 3]
     if q_words:
         has_match = any(w in p_norm for w in q_words)
         if not has_match:
-            logger.info(f"  └─ ❌ [BE Filter] Produkt '{product_name}' zamítnut (žádné ze slov {q_words} nebylo v názvu)")
             return False
 
-    logger.info(f"  └─ ✅ [BE Filter] Produkt '{product_name}' schválen!")
     return True
 
 
@@ -188,12 +183,10 @@ async def _throttled_off_get(client: httpx.AsyncClient, url: str, params: dict) 
         async with _off_request_lock:
             wait = _OFF_MIN_INTERVAL_SECONDS - (time.monotonic() - _off_last_request_at)
             if wait > 0:
-                logger.debug(f"⏳ [Throttling] Čekám {wait:.2f}s před odesláním na OFF...")
                 await asyncio.sleep(wait)
             _off_last_request_at = time.monotonic()
             return await client.get(url, params=params)
 
-    # Zvýšeno ze 4.0 na 30.0 sekund, aby dotazy bezpečně přečkaly ve frontě!
     return await asyncio.wait_for(_acquire_and_fetch(), timeout=30.0)
 
 
@@ -204,32 +197,31 @@ async def fetch_off_image(client: httpx.AsyncClient, search_term: str, original_
         "search_simple": "1",
         "action": "process",
         "json": "1",
-        "page_size": "5",
+        "page_size": "24",  # ZVÝŠENO Z 5 NA 24! (Hodně produktů nahoře v OFF nemá fotku)
         "fields": "product_name,image_front_url,image_url",
     }
 
     try:
-        logger.info(f"📡 [BE OFF Fetch] Odesílám dotaz na Open Food Facts pro: '{search_term}'")
+        logger.info(f"📡 [BE OFF Fetch] Hledám v Open Food Facts: '{search_term}'")
         response = await _throttled_off_get(client, target_url, request_params)
 
         if response.status_code != 200:
-            logger.warning(f"⚠️ [BE OFF Fetch] OFF vrátil status {response.status_code}")
             return None
 
         payload = response.json()
         products = payload.get("products") or []
-        logger.info(f"📦 [BE OFF Fetch] Získán seznam {len(products)} produktů z OFF pro '{search_term}'")
-
-        for index, prod in enumerate(products, 1):
+        
+        # OFF vrátil produkty, teď je projdeme a najdeme první, který má obrázek a prošel validací
+        for prod in products:
             pname = prod.get("product_name", "Bez názvu")
             img = prod.get("image_front_url") or prod.get("image_url")
-            logger.info(f"  ├─ Candidate #{index}: '{pname}' (Image: {'Ano' if img else 'Ne'})")
 
             if img and is_relevant_product(original_query, pname):
+                logger.info(f"  ├─ ✅ Našlo se: '{pname}' -> {img}")
                 return img
 
     except Exception as exc:
-        logger.warning(f"⚠️ [BE OFF Fetch] Výjimka při vyhledávání '{search_term}': {exc}")
+        logger.warning(f"⚠️ [BE OFF Fetch] Výjimka pro '{search_term}': {exc}")
 
     return None
 
@@ -240,8 +232,6 @@ async def proxy_image(
     code: str | None = Query(None, min_length=8, max_length=32),
 ) -> dict:
     start_time = time.monotonic()
-    search_label = query or code or "neznámý"
-    logger.info(f"🚀 [BE Endpoint] PŘIJAT POŽADAVEK -> Query: '{query}', Code: '{code}'")
 
     try:
         normalized_query = " ".join(query.split()) if query else None
@@ -252,44 +242,33 @@ async def proxy_image(
 
         cache_key = f"ean:{normalized_code}" if normalized_code else f"name:{(normalized_query or '').lower()}"
 
+        # 1. Zkontrolujeme Cache (díky opravě už nevrací "stuck" negativní výsledky)
         cached_image_url = get_cached_image_url(cache_key)
-
-        if cached_image_url is not None:
-            elapsed = round((time.monotonic() - start_time) * 1000)
-            if cached_image_url != "":
-                logger.info(f"⚡ [BE Cache HIT] Vráceno z databáze za {elapsed} ms -> '{cached_image_url}'")
-                return {"image_url": cached_image_url}
-            else:
-                logger.info(f"🛡️ [BE Cache FRESH NEGATIVE] V databázi je čerstvý negativní záznam. Vráceno za {elapsed} ms -> None")
-                return {"image_url": None}
+        if cached_image_url:
+            return {"image_url": cached_image_url}
 
         cleaned_query = clean_search_query(normalized_query) if normalized_query else None
-        logger.info(f"🧹 [BE Clean] Původní: '{normalized_query}' -> Vyčištěno: '{cleaned_query}'")
-
-        headers = {"User-Agent": _OFF_USER_AGENT}
         matched_image_url = None
 
-        # Zvýšeno timeout pro httpx na 15.0, kdyby OFF server vracel data příliš pomalu
-        async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
-            # 1. Pokus: Vyčištěný název
+        async with httpx.AsyncClient(timeout=15.0, headers={"User-Agent": _OFF_USER_AGENT}) as client:
+            # 2. Pokus: Vyčištěný název
             if cleaned_query:
                 matched_image_url = await fetch_off_image(client, cleaned_query, normalized_query or "")
 
-            # 2. Pokus: První hlavní slovo (fallback)
+            # 3. Pokus: První hlavní slovo (fallback)
             if not matched_image_url and cleaned_query:
                 first_word = cleaned_query.split()[0]
                 if len(first_word) >= 3 and first_word != cleaned_query:
-                    logger.info(f"🔄 [BE Fallback] Zkouším hledat pouze slovo '{first_word}'")
                     matched_image_url = await fetch_off_image(client, first_word, normalized_query or "")
 
-        elapsed = round((time.monotonic() - start_time) * 1000)
-        logger.info(f"💾 [BE Store & Return] Hotovo za {elapsed} ms. Výsledek '{matched_image_url or 'NULL'}' uložím do keše.")
-        store_cached_image_url(cache_key, normalized_query or normalized_code or "", matched_image_url)
+        # 4. Pokud našel, uloží do DB
+        if matched_image_url:
+            store_cached_image_url(cache_key, normalized_query or normalized_code or "", matched_image_url)
 
         return {"image_url": matched_image_url}
 
     except Exception as exc:
-        logger.error(f"❌ [BE ERROR] Chyba proxy_image pro '{search_label}': {exc}", exc_info=True)
+        logger.error(f"❌ [BE ERROR] Chyba proxy_image: {exc}")
         return {"image_url": None}
 
 
@@ -300,7 +279,6 @@ async def offers(
     stores: str = Query("", description="Comma-separated store IDs"),
     include_missing: bool = Query(False, description="Include items not currently on sale"),
 ) -> dict:
-    logger.info(f"📊 [Offers] Načítám nabídky pro rules='{rules or items}', stores='{stores}'")
     tracking_rules = parse_tracking_rules(items, rules)
     store_ids = {s.strip() for s in stores.split(",") if s.strip()} or None
 
