@@ -1,200 +1,75 @@
 import { useEffect, useState } from "react";
-import { API_BASE_URL } from "../api/client";
+import { lookupImage } from "../api/imageLookup";
+import type { ImageLookupMode } from "../api/client";
 import { VISUAL_SOURCES } from "../visuals";
 
 interface ProductVisualProps {
   imageUrl: string | null;
   tag: string;
   visualKey?: string | null;
-  ean?: string | null;
   productName: string | null;
-  size?: "card" | "hit";
+  imageLookupMode: ImageLookupMode;
+  size?: "card" | "hit" | "full";
 }
 
-// Paměťový cache v JS pro sdílení dotazů mezi všemi kartami na stránce
-const imageCache = new Map<string, Promise<string | null>>();
-
-function isValidImageUrl(value: string | null | undefined) {
+function isValidImageUrl(value: string | null | undefined): value is string {
   return Boolean(value && /^https?:\/\//i.test(value));
 }
 
-function normalizeQuery(value: string | null | undefined) {
+function normalizeName(value: string | null | undefined) {
   return (value ?? "").trim().replace(/\s+/g, " ");
 }
 
-function lookupVisualQuery(visualKey: string | null | undefined) {
-  if (!visualKey) {
-    return null;
-  }
-  return VISUAL_SOURCES[visualKey]?.remoteQuery ?? null;
-}
-
-function resolveImageQueries(productName: string | null, tag: string, visualKey: string | null | undefined) {
-  const candidates = [normalizeQuery(productName), normalizeQuery(tag), lookupVisualQuery(visualKey)];
-  const seen = new Set<string>();
-  const queries: string[] = [];
-  for (const candidate of candidates) {
-    if (candidate && !seen.has(candidate.toLowerCase())) {
-      seen.add(candidate.toLowerCase());
-      queries.push(candidate);
-    }
-  }
-  return queries;
-}
-
-function Placeholder({ label, sizeClass }: { label: string; sizeClass: string }) {
+function Placeholder({ label, sizeClass, fullSize }: { label: string; sizeClass: string; fullSize: boolean }) {
   return (
     <div
       aria-hidden="true"
-      className={`${sizeClass} flex shrink-0 items-center justify-center rounded-lg bg-stone-800 text-[10px] font-bold uppercase tracking-[0.18em] text-stone-400 ring-1 ring-stone-700`}
+      className={`${sizeClass} ${fullSize ? "flex items-center justify-center overflow-hidden bg-white p-4 text-center text-xs font-semibold leading-tight text-slate-500" : "flex shrink-0 items-center justify-center overflow-hidden rounded-xl bg-slate-100 p-1 text-center text-[10px] font-bold uppercase leading-tight tracking-[0.12em] text-slate-600 ring-1 ring-slate-200"}`}
     >
       {label}
     </div>
   );
 }
 
-async function fetchProductImageByEan(ean: string | null | undefined, fallbackUrl: string | null) {
-  if (isValidImageUrl(fallbackUrl)) {
-    return fallbackUrl;
-  }
-
-  const normalizedEan = normalizeQuery(ean);
-  if (!normalizedEan || normalizedEan.length < 8) {
-    return null;
-  }
-
-  const cacheKey = `ean:${normalizedEan}`;
-  if (imageCache.has(cacheKey)) {
-    console.log(`⚡ [FE Cache HIT] Sdílený požadavek v paměti pro EAN: '${cacheKey}'`);
-    return imageCache.get(cacheKey)!;
-  }
-
-  const request = (async () => {
-    try {
-      const delay = Math.random() * 2000;
-      await new Promise((resolve) => setTimeout(resolve, delay));
-
-      const url = `${API_BASE_URL}/api/proxy-image?code=${encodeURIComponent(normalizedEan)}`;
-      console.log(`🌐 [FE 2/4] Volám EAN proxy -> ${url}`);
-
-      const response = await fetch(url);
-
-      if (!response.ok) {
-        return null;
-      }
-
-      const contentType = response.headers.get("content-type") ?? "";
-      const rawText = await response.text();
-      if (!rawText || !contentType.includes("application/json")) {
-        return null;
-      }
-
-      const data = JSON.parse(rawText) as { image_url?: string | null; imageUrl?: string | null };
-      return data.imageUrl ?? data.image_url ?? null;
-    } catch {
-      return null;
-    }
-  })();
-
-  imageCache.set(cacheKey, request);
-  return request;
-}
-
-async function fetchProductImageByName(productName: string | null, fallbackUrl: string | null) {
-  if (isValidImageUrl(fallbackUrl)) {
-    return fallbackUrl;
-  }
-
-  const query = normalizeQuery(productName);
-  if (!query) {
-    return null;
-  }
-
-  const cacheKey = `name:${query.toLowerCase()}`;
-  
-  // Pokud jakákoliv jiná karta už tento dotaz posílá nebo poslala, okamžitě použijeme její Promise
-  if (imageCache.has(cacheKey)) {
-    console.log(`⚡ [FE Cache HIT] Znovupoužívám sdílený dotaz pro: '${cacheKey}'`);
-    return imageCache.get(cacheKey)!;
-  }
-
-  const request = (async () => {
-    try {
-      const delay = Math.random() * 1500;
-      await new Promise((resolve) => setTimeout(resolve, delay));
-
-      const url = `${API_BASE_URL}/api/proxy-image?query=${encodeURIComponent(query)}`;
-      console.log(`🌐 [FE 2/4] Volám Name proxy -> ${url}`);
-
-      const response = await fetch(url);
-
-      if (!response.ok) {
-        return null;
-      }
-
-      const data = (await response.json()) as { image_url?: string | null; imageUrl?: string | null };
-      const result = data.imageUrl ?? data.image_url ?? null;
-      console.log(`📥 [FE 3/4] Odpověď pro název '${query}':`, result);
-      return result;
-    } catch (error) {
-      console.error("❌ Chyba při stahování přes backend proxy:", error);
-      return null;
-    }
-  })();
-
-  // Uložíme Promise do paměti ještě PŘED vyřízením, aby všechny paralelní karty sdílely stejný fetch
-  imageCache.set(cacheKey, request);
-  return request;
-}
-
-export function ProductVisual({ imageUrl, tag, visualKey, ean, productName, size = "card" }: ProductVisualProps) {
-  const [resolvedImage, setResolvedImage] = useState<string | null>(imageUrl ?? null);
+export function ProductVisual({ imageUrl, tag, visualKey, productName, imageLookupMode, size = "card" }: ProductVisualProps) {
+  const [resolvedImage, setResolvedImage] = useState<string | null>(isValidImageUrl(imageUrl) ? imageUrl : null);
   const [imageFailed, setImageFailed] = useState(false);
-  const [isFetching, setIsFetching] = useState(!isValidImageUrl(imageUrl));
-  const sizeClass = size === "hit" ? "h-14 w-14" : "h-16 w-16";
+  const fullSize = size === "full";
+  const sizeClass = fullSize ? "h-full w-full" : size === "hit" ? "h-14 w-14" : "h-16 w-16";
 
   useEffect(() => {
     let isActive = true;
-
-    const nextImage = imageUrl ?? null;
-    setResolvedImage(nextImage);
     setImageFailed(false);
-    setIsFetching(!isValidImageUrl(nextImage));
 
-    if (isValidImageUrl(nextImage)) {
+    if (isValidImageUrl(imageUrl)) {
+      setResolvedImage(imageUrl);
       return () => {
         isActive = false;
       };
     }
 
-    const queries = resolveImageQueries(productName, tag, visualKey);
+    setResolvedImage(null);
 
-    void (async () => {
-      let image = await fetchProductImageByEan(ean, nextImage);
-
-      if (!image) {
-        for (const query of queries) {
-          image = await fetchProductImageByName(query, nextImage);
-          if (image) break;
-        }
-      }
-
-      if (!isActive) {
-        return;
-      }
-
-      setResolvedImage(image ?? null);
-      setIsFetching(false);
-    })();
+    // Fotka se hledá VÝHRADNĚ podle přesného názvu produktu. Žádný záložní dotaz podle sledovaného
+    // hesla ("paprika") ani podle obecné kategorie (visuals.ts): právě to způsobovalo, že koření
+    // dostalo fotku zeleniny a různé produkty sdílely tutéž fotku. Když backend nenajde TENTO produkt,
+    // je poctivé ukázat placeholder, ne odhad.
+    const name = normalizeName(productName);
+    if (name) {
+      void lookupImage(name, imageLookupMode).then((outcome) => {
+        if (isActive && outcome.kind === "found") setResolvedImage(outcome.url);
+      });
+    }
 
     return () => {
       isActive = false;
     };
-  }, [ean, imageUrl, productName, tag, visualKey]);
+  }, [imageUrl, productName, imageLookupMode]);
 
-  if (isFetching || !resolvedImage || imageFailed) {
-    const placeholderLabel = (productName ?? tag ?? lookupVisualQuery(visualKey) ?? "foto").slice(0, 12);
-    return <Placeholder label={placeholderLabel} sizeClass={sizeClass} />;
+  if (!resolvedImage || imageFailed) {
+    // tag/visualKey slouží jen jako TEXT na placeholderu - nikdy k výběru fotky.
+    const label = (productName || tag || (visualKey ? VISUAL_SOURCES[visualKey]?.label : "") || "foto").slice(0, 12);
+    return <Placeholder label={label} sizeClass={sizeClass} fullSize={fullSize} />;
   }
 
   return (
@@ -204,7 +79,7 @@ export function ProductVisual({ imageUrl, tag, visualKey, ean, productName, size
       loading="lazy"
       referrerPolicy="no-referrer"
       onError={() => setImageFailed(true)}
-      className={`${sizeClass} shrink-0 rounded-lg bg-stone-100 object-cover`}
+      className={`${sizeClass} ${fullSize ? "object-contain w-full h-full p-2" : "aspect-square shrink-0 rounded-xl bg-white p-1.5 object-contain ring-1 ring-slate-200"}`}
     />
   );
 }

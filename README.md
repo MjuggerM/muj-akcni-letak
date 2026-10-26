@@ -1,34 +1,26 @@
 # Muj akcni letak
 
 Osobní filtr nad kupi.cz: sleduješ jen svoje položky, ve svých obchodech.
-Backend staví na knihovně `kupiapi` (scraper kupi.cz). Frontend je Vite +
+Backend parsuje stránky Kupi.cz přímo, včetně obrázků produktů. Frontend je Vite +
 React + TS + Tailwind v4, se stejným designem jako náhled v chatu, ale
 napojený na skutečná data z backendu (žádná mock pole).
 
-## Než spustíš: ověř samotný scraper
+## Ověření scraperu
 
-Tohle je nejrychlejší způsob, jak zjistit, jestli kupiapi pořád umí
-scrapovat kupi.cz - úplně mimo FastAPI a frontend:
+Tento příkaz ověří připojení ke Kupi.cz a parsování nabídek i jejich obrázků:
 
 ```bash
 cd backend
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-python3 -c "from kupiapi.scraper import KupiScraper; import json; print(json.dumps(KupiScraper().get_discounts_by_search('vejce', max_pages=1), ensure_ascii=False, indent=2))"
+python -c "from app.kupi_service import _fetch_one_sync; import json; print(json.dumps(_fetch_one_sync('vejce'), ensure_ascii=False, indent=2))"
 ```
 
-- **Vrátí neprázdný JSON** → scraper žije, FastAPI a frontend níž ho jen
-  přeposílají/zobrazují, spusť je normálně.
-- **Spadne / vrátí `[]`** → buď síť (zkontroluj, že se z tvého stroje dá
-  otevřít kupi.cz), nebo si kupi.cz mezitím předělalo HTML strukturu,
-  kterou kupiapi parsuje (třídy jako `discount_price_value` v
-  `kupiapi/scraper.py` - `pip show -f kupiapi` ti ukáže, kam se
-  nainstalovala). To je oprava v kupiapi samotném, ne v tomhle projektu.
-
-Tohle jsem ověřit nemohl - sandbox, ve kterém jsem tenhle projekt stavěl,
-nemá do kupi.cz síťový přístup - takže tenhle krok je na tobě a je první
-věc, kterou bych zkusil, kdyby appka po spuštění nic neukazovala.
+- **Vrátí nabídky** → Kupi scraper funguje; adresy dostupných obrázků jsou v poli
+  `image_url`.
+- **Vrátí `[]` nebo chybu** → ověř přístup k `kupi.cz`. Pokud Kupi změnilo HTML,
+  uprav parser v `backend/app/kupi_service.py`.
 
 ## Spuštění backendu
 
@@ -51,27 +43,24 @@ npm install
 npm run dev
 ```
 
-Poběží na `http://localhost:5173`, volá backend na `http://localhost:8000`
+Poběží na `http://localhost:3000`, volá backend na `http://localhost:8000`
 (nastavitelné v `.env` přes `VITE_API_URL`).
 
 ## Ověřeno vs. neověřeno
 
-Reálně otestováno v sandboxu: backend (import, `/api/stores`, `/api/offers`
-s mockovaným scraperem, zip/flatten logika, souběžné stahování), a
-frontend (`npm run build` přes Tailwind v4 + TS, žádné typové chyby).
-Jediná věc, kterou jsem odsud nemohl ověřit, je živé volání
-`KupiScraper` → kupi.cz (síť v sandboxu tam nepustí) - proto sekce výše.
+Backendové testy pokrývají parsování nabídek a obrázků, FE ověřuje
+`npm run build`.
 
 ## Co má smysl vědět, než na to navážeš
 
-- **Ikony obchodů**: kupiapi vrací jen textový název obchodu (např. "Albert
-  hypermarket"), žádné logo/ID. `StoreIcon` je barevná tečka podle
-  přibližné brand barvy obchodu (`components/StoreIcon.tsx`) - ne skutečné
+- **Ikony obchodů**: Kupi vrací jen textový název obchodu (např. "Albert
+  hypermarket"), žádné logo/ID. `storeColors` je barevná tečka podle
+  přibližné brand barvy obchodu (`components/storeColors.ts`) - ne skutečné
   logo. Reálná loga by šlo dodat, ale hotlinkování cizích brand assetů má
   vlastní rizika (rozbije se, když si to přesunou); zatím jsem to neřešil.
 - **`validity` se neparsuje na datum**: kupi.cz k tomu používá nekonzistentní
   fráze ("dnes končí", "po 10. 8. - ne 16. 8.", "platí do úterý 11. 8.").
-  Posílám to na frontend jako čitelný text tak, jak to vrátí kupiapi, místo
+  Posílám to na frontend jako čitelný text tak, jak ho vrátí Kupi, místo
   abych to nespolehlivě parsoval na `Date`.
 - **"Upozornění" je zatím jen banner v appce** (kolik sledovaných položek
   je právě v akci), ne push notifikace mimo prohlížeč – to by chtělo
@@ -84,6 +73,6 @@ Jediná věc, kterou jsem odsud nemohl ověřit, je živé volání
 - **Cache**: výsledky hledání se drží 20 minut v paměti backendu
   (`CACHE_TTL_SECONDS` v `config.py`), aby se kupi.cz nescrapoval při
   každém refreshi frontendu.
-- Scraper je závislý na HTML struktuře kupi.cz (třídy jako
-  `discount_price_value`, `discount_amount`...) – když si kupi.cz předělá
-  frontend, `kupiapi` se rozbije a je to mimo tenhle projekt opravit.
+- Parser je závislý na HTML struktuře kupi.cz (třídy jako
+  `discount_price_value`, `discount_amount`...) – když ji Kupi změní, uprav
+  `backend/app/kupi_service.py`.

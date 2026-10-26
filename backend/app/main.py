@@ -1,20 +1,25 @@
-import asyncio
 import logging
-import re
-import time
-import unicodedata
-from datetime import datetime, timezone
 import json
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
-import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import MAX_TRACKED_ITEMS, STORES
-from .image_cache import clear_empty_negative_cache, get_cached_image_url, store_cached_image_url
-from .kupi_service import build_store_summaries, build_top_hits, get_offers_for_rules, get_product_suggestions
-from .schemas import Offer, OffersResponse, StoreOut, StoreSummary, TrackingRule
+from .image_service import ImageLookupService
+from .kupi_service import get_offers_for_rules, get_product_preview, get_product_suggestions
+from .schemas import (
+    Offer,
+    OffersResponse,
+    PreferencesUpdate,
+    ProductPreview,
+    RuleExclusionUpdate,
+    StoreOut,
+    TrackingRule,
+)
 from pydantic import TypeAdapter, ValidationError
 
 # ------------------------------------------------------------------------------
@@ -26,10 +31,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger("akcni_letak.proxy")
 
-app = FastAPI(title="Muj akcni letak API")
 
-# Při startu zlikvidujeme veškerou starou 'negative cache', která doteď blokovala načítání
-clear_empty_negative_cache()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Jediný worker, který smí mluvit s Open Food Facts (viz app/image_service.py).
+    service = ImageLookupService()
+    app.state.image_service = service
+    await service.start()
+    try:
+        yield
+    finally:
+        await service.stop()
+
+
+app = FastAPI(title="Muj akcni letak API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -57,29 +73,95 @@ def get_preferences() -> dict:
         return {"tracking_rules": [], "default_stores": list(STORES.keys())}
     try:
         data = json.loads(prefs_path.read_text(encoding="utf-8"))
-        rules = data.get("tracking_rules") or []
-        return {"tracking_rules": rules, "default_stores": data.get("default_stores", list(STORES.keys()))}
+        rules = TypeAdapter(list[TrackingRule]).validate_python(data.get("tracking_rules") or [])
+        return {
+            "tracking_rules": [rule.model_dump() for rule in rules],
+            "default_stores": data.get("default_stores", list(STORES.keys())),
+        }
     except Exception as exc:
         logger.warning(f"Chyba při čtení preferences.json: {exc}")
         return {"tracking_rules": [], "default_stores": list(STORES.keys())}
 
 
 @app.post("/api/preferences")
-def set_preferences(prefs: dict) -> dict:
+def set_preferences(prefs: PreferencesUpdate) -> dict:
     prefs_path = Path(__file__).parent / "preferences.json"
     try:
-        if not isinstance(prefs, dict):
-            raise ValueError("Invalid payload")
-        tracking_rules = prefs.get("tracking_rules", [])
-        default_stores = prefs.get("default_stores", list(STORES.keys()))
+        default_stores = prefs.default_stores
+        if default_stores is None:
+            default_stores = list(STORES.keys())
         prefs_path.write_text(
-            json.dumps({"tracking_rules": tracking_rules, "default_stores": default_stores}, ensure_ascii=False, indent=2),
+            json.dumps(
+                {
+                    "tracking_rules": [rule.model_dump() for rule in prefs.tracking_rules],
+                    "default_stores": default_stores,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
             encoding="utf-8"
         )
         return {"ok": True}
-    except Exception as exc:
+    except OSError as exc:
         logger.error(f"Chyba při zápisu preferences.json: {exc}")
-        return {"ok": False, "error": str(exc)}
+        raise HTTPException(status_code=500, detail="Could not save preferences.") from exc
+
+
+@app.patch("/api/rules/{rule_id}/exclude")
+def exclude_from_rule(rule_id: str, update: RuleExclusionUpdate) -> dict:
+    """Persist one product or product-type exclusion for a saved rule."""
+    prefs_path = Path(__file__).parent / "preferences.json"
+    try:
+        data = json.loads(prefs_path.read_text(encoding="utf-8")) if prefs_path.exists() else {}
+        rules = TypeAdapter(list[TrackingRule]).validate_python(data.get("tracking_rules") or [])
+        rule_index = next((index for index, rule in enumerate(rules) if rule.id == rule_id), None)
+        if rule_index is None:
+            raise HTTPException(status_code=404, detail="Sledovací pravidlo nebylo nalezeno.")
+
+        rule = rules[rule_index]
+        value = update.value.strip()
+        target = rule.excluded_terms if update.type == "term" else rule.excluded_products
+        normalized_value = " ".join(value.casefold().split())
+        if not any(" ".join(existing.casefold().split()) == normalized_value for existing in target):
+            target.append(value)
+        rules[rule_index] = rule
+        data["tracking_rules"] = [item.model_dump() for item in rules]
+        data.setdefault("default_stores", list(STORES.keys()))
+        prefs_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {"ok": True, "tracking_rule": rule.model_dump()}
+    except HTTPException:
+        raise
+    except (OSError, json.JSONDecodeError, ValidationError) as exc:
+        logger.error("Could not update rule exclusion: %s", exc)
+        raise HTTPException(status_code=500, detail="Could not save the exclusion.") from exc
+
+
+@app.delete("/api/rules/{rule_id}/exclude")
+def remove_rule_exclusion(rule_id: str, update: RuleExclusionUpdate) -> dict:
+    """Remove one product or product-type exclusion when the user undoes it."""
+    prefs_path = Path(__file__).parent / "preferences.json"
+    try:
+        data = json.loads(prefs_path.read_text(encoding="utf-8")) if prefs_path.exists() else {}
+        rules = TypeAdapter(list[TrackingRule]).validate_python(data.get("tracking_rules") or [])
+        rule_index = next((index for index, rule in enumerate(rules) if rule.id == rule_id), None)
+        if rule_index is None:
+            raise HTTPException(status_code=404, detail="Sledovací pravidlo nebylo nalezeno.")
+
+        rule = rules[rule_index]
+        value = update.value.strip()
+        target = rule.excluded_terms if update.type == "term" else rule.excluded_products
+        normalized_value = " ".join(value.casefold().split())
+        target[:] = [entry for entry in target if " ".join(entry.casefold().split()) != normalized_value]
+        rules[rule_index] = rule
+        data["tracking_rules"] = [item.model_dump() for item in rules]
+        data.setdefault("default_stores", list(STORES.keys()))
+        prefs_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {"ok": True, "tracking_rule": rule.model_dump()}
+    except HTTPException:
+        raise
+    except (OSError, json.JSONDecodeError, ValidationError) as exc:
+        logger.error("Could not remove rule exclusion: %s", exc)
+        raise HTTPException(status_code=500, detail="Could not update the exclusion.") from exc
 
 
 def parse_tracked_items(items: str) -> list[str]:
@@ -113,163 +195,30 @@ async def product_suggestions(query: str = Query(..., min_length=2, max_length=8
     return await get_product_suggestions(query.strip())
 
 
-# --- Čištění a validace dotazů pro vyhledávání obrázků --------------------
-
-def clean_search_query(query: str) -> str:
-    if not query:
-        return ""
-
-    q = query.lower()
-    stop_words = [
-        "albertovo uzenářství", "albertovo uzenarstvi", "kostelecké uzeniny", "kostelecke uzeniny",
-        "řezníkův talíř", "reznikov talir", "reznikuv talir", "srdce domova", "jihočeský", "jihocesky",
-        "nature's promise", "natures promise", "billa bonvia", "karlova koruna", "česká farma", "ceska farma",
-        "jaroměřický", "jaromericky", "delikátní", "delikatni", "yes plants", "grill party",
-        "madeta", "olma", "milko", "albert", "billa", "penny", "lidl", "pilos", "pikok", "le&co", "le & co",
-        "idema", "president", "kupi", "dětská", "detska",
-        "nejvyšší jakosti", "nejvyssi jakosti", "výběrová", "vyberova", "standard", "poctivá", "poctiva",
-        "z podestýlky", "z podestylky", "z poděbrad", "z podebrad", "od kosti", "na rohlik", "na rohlík",
-        "akce", "sleva", "balení", "baleni"
-    ]
-
-    for word in stop_words:
-        q = q.replace(word, " ")
-
-    q = re.sub(r'\b[a-z0-9]\b', ' ', q)
-    cleaned = " ".join(q.split())
-    return cleaned if len(cleaned) >= 2 else query
+@app.get("/api/product-preview", response_model=list[ProductPreview])
+async def product_preview(query: str = Query(..., min_length=2, max_length=80)) -> list[dict]:
+    return await get_product_preview(query.strip(), limit=10)
 
 
-def normalize_str(s: str) -> str:
-    if not s:
-        return ""
-    s = unicodedata.normalize('NFD', s)
-    s = ''.join(c for c in s if unicodedata.category(c) != 'Mn')
-    return s.lower()
-
-
-def is_relevant_product(query: str, product_name: str) -> bool:
-    if not product_name:
-        return False
-
-    q_norm = normalize_str(query)
-    p_norm = normalize_str(product_name)
-
-    mismatch_keywords = ["tycinka", "snack", "krekr", "cracker", "chips", "protein bar"]
-    for bad in mismatch_keywords:
-        if bad in p_norm and bad not in q_norm:
-            return False
-
-    q_words = [w for w in q_norm.split() if len(w) >= 3]
-    if q_words:
-        has_match = any(w in p_norm for w in q_words)
-        if not has_match:
-            return False
-
-    return True
-
-
-# --- Open Food Facts image proxy -------------------------------------------
-_off_request_lock = asyncio.Lock()
-_off_last_request_at = 0.0
-_OFF_MIN_INTERVAL_SECONDS = 0.5
-_OFF_USER_AGENT = "MujAkcniLetak/1.0 (personal project; contact: replace-with-your-email@example.com)"
-
-
-async def _throttled_off_get(client: httpx.AsyncClient, url: str, params: dict) -> httpx.Response:
-    global _off_last_request_at
-
-    async def _acquire_and_fetch():
-        async with _off_request_lock:
-            wait = _OFF_MIN_INTERVAL_SECONDS - (time.monotonic() - _off_last_request_at)
-            if wait > 0:
-                await asyncio.sleep(wait)
-            _off_last_request_at = time.monotonic()
-            return await client.get(url, params=params)
-
-    return await asyncio.wait_for(_acquire_and_fetch(), timeout=30.0)
-
-
-async def fetch_off_image(client: httpx.AsyncClient, search_term: str, original_query: str) -> str | None:
-    target_url = "https://world.openfoodfacts.org/cgi/search.pl"
-    request_params = {
-        "search_terms": search_term,
-        "search_simple": "1",
-        "action": "process",
-        "json": "1",
-        "page_size": "24",  # ZVÝŠENO Z 5 NA 24! (Hodně produktů nahoře v OFF nemá fotku)
-        "fields": "product_name,image_front_url,image_url",
-    }
-
-    try:
-        logger.info(f"📡 [BE OFF Fetch] Hledám v Open Food Facts: '{search_term}'")
-        response = await _throttled_off_get(client, target_url, request_params)
-
-        if response.status_code != 200:
-            return None
-
-        payload = response.json()
-        products = payload.get("products") or []
-        
-        # OFF vrátil produkty, teď je projdeme a najdeme první, který má obrázek a prošel validací
-        for prod in products:
-            pname = prod.get("product_name", "Bez názvu")
-            img = prod.get("image_front_url") or prod.get("image_url")
-
-            if img and is_relevant_product(original_query, pname):
-                logger.info(f"  ├─ ✅ Našlo se: '{pname}' -> {img}")
-                return img
-
-    except Exception as exc:
-        logger.warning(f"⚠️ [BE OFF Fetch] Výjimka pro '{search_term}': {exc}")
-
-    return None
-
+# --- Fotky produktů -----------------------------------------------------------
+# Veškerá logika (párování, odstup mezi dotazy na OFF, fronta) je v app/image_service.py.
 
 @app.get("/api/proxy-image")
 async def proxy_image(
-    query: str | None = Query(None, min_length=2, max_length=120),
-    code: str | None = Query(None, min_length=8, max_length=32),
+    request: Request,
+    query: str = Query(..., min_length=2, max_length=120),
+    mode: Literal["legacy", "quality"] = Query("legacy"),
 ) -> dict:
-    start_time = time.monotonic()
+    """Nikdy nečeká na Open Food Facts.
 
-    try:
-        normalized_query = " ".join(query.split()) if query else None
-        normalized_code = "".join(code.split()) if code else None
-
-        if not normalized_code and not normalized_query:
-            return {"image_url": None}
-
-        cache_key = f"ean:{normalized_code}" if normalized_code else f"name:{(normalized_query or '').lower()}"
-
-        # 1. Zkontrolujeme Cache (díky opravě už nevrací "stuck" negativní výsledky)
-        cached_image_url = get_cached_image_url(cache_key)
-        if cached_image_url:
-            return {"image_url": cached_image_url}
-
-        cleaned_query = clean_search_query(normalized_query) if normalized_query else None
-        matched_image_url = None
-
-        async with httpx.AsyncClient(timeout=15.0, headers={"User-Agent": _OFF_USER_AGENT}) as client:
-            # 2. Pokus: Vyčištěný název
-            if cleaned_query:
-                matched_image_url = await fetch_off_image(client, cleaned_query, normalized_query or "")
-
-            # 3. Pokus: První hlavní slovo (fallback)
-            if not matched_image_url and cleaned_query:
-                first_word = cleaned_query.split()[0]
-                if len(first_word) >= 3 and first_word != cleaned_query:
-                    matched_image_url = await fetch_off_image(client, first_word, normalized_query or "")
-
-        # 4. Pokud našel, uloží do DB
-        if matched_image_url:
-            store_cached_image_url(cache_key, normalized_query or normalized_code or "", matched_image_url)
-
-        return {"image_url": matched_image_url}
-
-    except Exception as exc:
-        logger.error(f"❌ [BE ERROR] Chyba proxy_image: {exc}")
-        return {"image_url": None}
+    status: "found"   -> image_url je fotka TOHOTO produktu
+            "missing" -> potvrzeně žádná odpovídající fotka není (placeholder je konečný)
+            "pending" -> zařazeno / zpracovává se; zeptej se znovu za `retry_after` sekund
+            "error"   -> Open Food Facts je teď nedostupný; zkus to později
+    """
+    service: ImageLookupService = request.app.state.image_service
+    result = service.lookup(query, mode)
+    return {"status": result.status, "image_url": result.image_url, "retry_after": result.retry_after}
 
 
 @app.get("/api/offers", response_model=OffersResponse)
@@ -305,7 +254,12 @@ async def offers(
                             "price": None,
                             "amount": None,
                             "validity": None,
-                            "tracked_item": {"keyword": rule.query, "blacklist": rule.excluded_terms or [], "temporary": False},
+                            "tracked_item": {
+                                "keyword": rule.query,
+                                "excluded_terms": rule.excluded_terms or [],
+                                "excluded_products": rule.excluded_products or [],
+                                "temporary": False,
+                            },
                             "tracking_rule_id": rule.id,
                             "visual_key": rule.visual_key,
                             "on_sale": False,
@@ -313,14 +267,8 @@ async def offers(
                         }
                     )
 
-    summaries = build_store_summaries(flat)
-    store_order = {summary["id"] or f"raw:{summary['label']}": index for index, summary in enumerate(summaries)}
-    flat.sort(key=lambda offer: store_order.get(offer.get("store_id") or f"raw:{offer['shop_raw']}", len(store_order)))
-
     return {
         "items": [Offer(**o) for o in flat],
-        "store_summaries": [StoreSummary(**summary) for summary in summaries],
-        "top_hits": [Offer(**offer) for offer in build_top_hits(flat)],
         "fetched_at": datetime.now(timezone.utc),
         "errors": errors,
     }

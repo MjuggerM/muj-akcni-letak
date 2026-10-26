@@ -1,9 +1,8 @@
 """
-Wraps the kupiapi library (KupiScraper) and turns its output into the
-flat Offer shape the frontend consumes.
+Parses Kupi search pages into the flat Offer shape the frontend consumes.
 
-kupiapi's get_discounts_by_search() returns JSON grouped BY PRODUCT, with
-parallel arrays for each shop carrying it, e.g.:
+Kupi groups results BY PRODUCT, with parallel arrays for each shop carrying
+it, e.g.:
 
     {
         "name": "Vejce M 10ks",
@@ -17,7 +16,7 @@ shops[i] / prices[i] / amounts[i] / validities[i] all describe the same
 offer at index i - they must be zipped together, not treated as separate
 lists. This module flattens that into one Offer per (product, shop) pair.
 
-Two things kupiapi does NOT give us, by design of the source site's HTML:
+Kupi does not provide the following as structured values:
   - a store ID or logo (only the free-text shop name) -> see config.STORES
   - a machine-parsable date for "validity" (it's phrases like "dnes
     končí" / "po 10. 8. - ne 16. 8.") -> we pass it through as-is rather
@@ -29,15 +28,19 @@ import json
 import re
 import time
 import unicodedata
+from urllib.parse import urljoin, urlparse
 
-from kupiapi.scraper import KupiScraper
+import requests
+from bs4 import BeautifulSoup
 from starlette.concurrency import run_in_threadpool
 
 from .config import CACHE_TTL_SECONDS, DEFAULT_MAX_PAGES, STORES
-from .price_history import annotate_historical_bests
+from .product_matching import score_product
 from .schemas import TrackingRule
 
-_scraper = KupiScraper()
+KUPI_BASE_URL = "https://www.kupi.cz"
+KUPI_SEARCH_URL = f"{KUPI_BASE_URL}/hledej"
+KUPI_REQUEST_TIMEOUT_SECONDS = 15
 
 # Very small in-memory cache: {search_term: (timestamp, offers)}.
 # Fine for a single-user local app; swap for Redis if this ever runs
@@ -65,17 +68,14 @@ def _normalized_text(value: str | None) -> str:
 
 
 def _matches_rule(product_name: str | None, rule: TrackingRule) -> bool:
-    name = _normalized_text(product_name)
-    if not name:
-        return False
-    if any(_normalized_text(term) in name for term in rule.excluded_terms if term.strip()):
-        return False
-    if rule.match_mode == "exact":
-        exact_name = _normalized_text(rule.exact_product_name or rule.label)
-        # Kupi can append a size or a retailer modifier. Keeping the chosen
-        # product phrase intact still avoids unrelated results such as aspic.
-        return exact_name in name
-    return True
+    return score_product(
+        rule.query,
+        product_name,
+        match_mode=rule.match_mode,
+        exact_product_name=rule.exact_product_name or rule.label,
+        excluded_terms=rule.excluded_terms,
+        excluded_products=rule.excluded_products,
+    )["confidence"] != "none"
 
 
 def _number(value: str | None) -> float | None:
@@ -115,12 +115,7 @@ def _unit_price(price: str | None, amount: str | None) -> tuple[float | None, st
 
 
 def _image_url(product: dict) -> str | None:
-    """Read optional image fields from kupiapi without relying on one version.
-
-    kupiapi 1.0.11 does not currently scrape image tags. This keeps the API
-    forward-compatible with an upgraded or locally extended scraper and lets
-    the UI switch to real photos automatically once they are available.
-    """
+    """Read an optional image field while accepting multiple source shapes."""
     candidate_keys = (
         "image_front_url",
         "image_url",
@@ -159,6 +154,106 @@ def _image_url(product: dict) -> str | None:
     return None
 
 
+def _clean_text(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = " ".join(value.replace("\u00a0", " ").replace("\n", "").split())
+    if cleaned.startswith("/"):
+        cleaned = cleaned[1:].strip()
+    return cleaned or None
+
+
+def _product_image(product_node) -> str | None:
+    image = product_node.select_one(".product_image img")
+    if image is None:
+        return None
+
+    # Kupi puts a generic placeholder in `src` and the real image in `data-src`.
+    for attribute in ("data-src", "data-original", "src"):
+        candidate = image.get(attribute)
+        if not isinstance(candidate, str) or not candidate.strip():
+            continue
+        candidate = candidate.strip()
+        if "/no_img/" in candidate.lower() or "no-image" in candidate.lower():
+            continue
+
+        resolved = urljoin(KUPI_BASE_URL, candidate)
+        parsed = urlparse(resolved)
+        hostname = (parsed.hostname or "").lower()
+        if parsed.scheme in {"http", "https"} and (hostname == "kupi.cz" or hostname.endswith(".kupi.cz")):
+            return resolved
+    return None
+
+
+def _parse_search_page(html: bytes | str) -> list[dict]:
+    """Parse Kupi products, offers and thumbnails from the same search response."""
+    soup = BeautifulSoup(html, "html.parser")
+    products: list[dict] = []
+
+    for product_node in soup.find_all("div", class_="group_discounts"):
+        name_node = product_node.select_one(".product_name strong")
+        if name_node is None:
+            continue
+
+        discounts_table = product_node.find("div", class_="discounts_table")
+        if discounts_table is None:
+            break
+
+        shops = discounts_table.find_all("span", class_="discounts_shop_name")
+        if not shops:
+            break
+
+        product_data = discounts_table.find_all("div", class_="discount_row")
+        prices: list[str | None] = []
+        amounts: list[str | None] = []
+        validities: list[str | None] = []
+        for row in product_data:
+            price = row.find(class_="discount_price_value")
+            amount = row.find(class_="discount_amount")
+            validity = row.find("div", class_="discounts_validity")
+            prices.append(_clean_text(price.get_text() if price else None))
+            amounts.append(_clean_text(amount.get_text() if amount else None))
+            validities.append(_clean_text(validity.get_text() if validity else None))
+
+        products.append({
+            "name": _clean_text(name_node.get_text()),
+            "shops": [_clean_text(shop.get_text()) for shop in shops],
+            "prices": prices,
+            "amounts": amounts,
+            "validities": validities,
+            "image_url": _product_image(product_node),
+        })
+
+    return products
+
+
+def _fetch_search_results(item: str) -> str:
+    """Fetch Kupi pages once and parse both existing offer data and product photos."""
+    products: list[dict] = []
+    page = 1
+    while DEFAULT_MAX_PAGES == 0 or page <= DEFAULT_MAX_PAGES:
+        params = {"f": item, "vse": "0"}
+        if page > 1:
+            params["page"] = str(page)
+        response = requests.get(
+            KUPI_SEARCH_URL,
+            params=params,
+            timeout=KUPI_REQUEST_TIMEOUT_SECONDS,
+        )
+        if response.status_code != 200:
+            if page == 1:
+                return "[]"
+            break
+
+        page_products = _parse_search_page(response.content)
+        if not page_products:
+            break
+        products.extend(page_products)
+        page += 1
+
+    return json.dumps(products, ensure_ascii=False)
+
+
 def _flatten(raw_json: str, tracked_item: str) -> list[dict]:
     products = json.loads(raw_json)
     offers: list[dict] = []
@@ -188,19 +283,19 @@ def _flatten(raw_json: str, tracked_item: str) -> list[dict]:
                 "unit": unit,
                 "unit_price_label": f"{unit_price:.2f} Kč/{unit}" if unit_price is not None else None,
                 "is_best_deal": False,
-                "saving_vs_next_percent": None,
-                "better_deal": None,
             })
 
     return offers
 
 
 def enrich_offer_insights(offers: list[dict]) -> list[dict]:
-    """Mark the cheapest comparable offer for every tracked phrase and unit."""
+    """Mark the cheapest comparable package for each tracking rule and unit."""
+    for offer in offers:
+        offer["is_best_deal"] = False
+
     groups: dict[tuple[str, str], list[dict]] = {}
     for offer in offers:
         if offer.get("unit_price") is not None and offer.get("unit"):
-            # tracked_item may be a structured object; derive a stable key
             tracked = offer.get("tracked_item")
             rule_key = offer.get("tracking_rule_id") or (
                 tracked["keyword"] if isinstance(tracked, dict) and tracked.get("keyword") else tracked
@@ -208,128 +303,38 @@ def enrich_offer_insights(offers: list[dict]) -> list[dict]:
             groups.setdefault((rule_key, offer["unit"]), []).append(offer)
 
     for group in groups.values():
-        # Compare shops, not duplicate package variants inside one shop.
-        # A cheap Lidl egg pack must not create a misleading "go to Lidl"
-        # tip on another Lidl egg pack.
         by_shop: dict[str, list[dict]] = {}
         for offer in group:
             by_shop.setdefault(offer["shop_raw"], []).append(offer)
-        shop_winners = [min(shop_offers, key=lambda offer: offer["unit_price"]) for shop_offers in by_shop.values()]
-        ranked = sorted(shop_winners, key=lambda offer: offer["unit_price"])
-        winner = ranked[0]
-        winner["is_best_deal"] = True
-        if len(ranked) > 1 and ranked[1]["unit_price"] > winner["unit_price"]:
-            winner["saving_vs_next_percent"] = round(
-                (ranked[1]["unit_price"] - winner["unit_price"]) / ranked[1]["unit_price"] * 100
-            )
-        for shop_winner in ranked[1:]:
-            if shop_winner["unit_price"] <= winner["unit_price"]:
-                shop_winner["is_best_deal"] = True
-                continue
-            for offer in by_shop[shop_winner["shop_raw"]]:
-                if offer["unit_price"] > winner["unit_price"]:
-                    offer["better_deal"] = {
-                        "shop_name": winner["shop_raw"],
-                        "price": winner.get("price"),
-                        "amount": winner.get("amount"),
-                        "unit_price_label": winner.get("unit_price_label"),
-                    }
+        shop_winners = {
+            shop: min(shop_offers, key=lambda offer: offer["unit_price"])
+            for shop, shop_offers in by_shop.items()
+        }
+        lowest_unit_price = min(offer["unit_price"] for offer in shop_winners.values())
+        for winner in shop_winners.values():
+            if winner["unit_price"] == lowest_unit_price:
+                winner["is_best_deal"] = True
 
-    annotate_historical_bests(offers)
     return offers
 
 
-def build_store_summaries(offers: list[dict]) -> list[dict]:
-    grouped: dict[str, dict] = {}
-    for offer in offers:
-        key = offer.get("store_id") or f"raw:{offer['shop_raw']}"
-        if key not in grouped:
-            store_id = offer.get("store_id")
-            grouped[key] = {
-                "id": store_id,
-                "label": STORES[store_id]["label"] if store_id in STORES else offer["shop_raw"],
-                "offer_count": 0,
-                "coverage_count": 0,
-                "best_deal_count": 0,
-                "recommendation_score": 0,
-                "is_recommended": False,
-                "_covered_rules": set(),
-                "_best_rules": set(),
-            }
-        grouped[key]["offer_count"] += 1
-        tracked = offer.get("tracked_item")
-        tracked_key = tracked["keyword"] if isinstance(tracked, dict) and tracked.get("keyword") else tracked
-        rule_key = offer.get("tracking_rule_id") or tracked_key or offer["shop_raw"]
-        grouped[key]["_covered_rules"].add(rule_key)
-        if offer.get("is_best_deal"):
-            grouped[key]["_best_rules"].add(rule_key)
-
-    for summary in grouped.values():
-        summary["coverage_count"] = len(summary.pop("_covered_rules"))
-        summary["best_deal_count"] = len(summary.pop("_best_rules"))
-        # One-stop coverage matters most; winning the unit-price comparison is
-        # a meaningful secondary tie breaker. Raw sale percentage is omitted:
-        # it is often marketing noise rather than a useful shopping signal.
-        summary["recommendation_score"] = summary["coverage_count"] * 100 + summary["best_deal_count"] * 25
-
-    summaries = sorted(
-        grouped.values(),
-        key=lambda summary: (
-            -summary["recommendation_score"],
-            -summary["coverage_count"],
-            -summary["best_deal_count"],
-            -summary["offer_count"],
-            summary["label"],
-        ),
-    )
-    if summaries:
-        summaries[0]["is_recommended"] = True
-    return summaries
-
-
-def build_top_hits(offers: list[dict], limit: int = 3) -> list[dict]:
-    winners = [offer for offer in offers if offer.get("is_best_deal") and offer.get("unit_price") is not None]
-    return sorted(
-        winners,
-        key=lambda offer: (
-            not offer.get("is_historical_best", False),
-            -(offer.get("saving_vs_next_percent") or 0),
-            (offer.get("tracked_item") or {}).get("keyword") if isinstance(offer.get("tracked_item"), dict) else offer.get("tracked_item"),
-        ),
-    )[:limit]
-
-
 def _fetch_one_sync(item: str) -> list[dict]:
-    """Blocking call - runs kupiapi's scraper. Only call via run_in_threadpool."""
+    """Blocking Kupi request; only call through run_in_threadpool."""
     now = time.time()
     cached = _cache.get(item)
     if cached is not None and now - cached[0] < CACHE_TTL_SECONDS:
         return cached[1]
 
-    raw_json = _scraper.get_discounts_by_search(item, max_pages=DEFAULT_MAX_PAGES)
+    raw_json = _fetch_search_results(item)
     offers = _flatten(raw_json, item)
     _cache[item] = (now, offers)
     return offers
 
 
-async def get_offers_for_items(
-    items: list[str], store_ids: set[str] | None
-) -> tuple[list[dict], list[str]]:
-    """
-    Fetches (and flattens) offers for every tracked item concurrently,
-    then filters by the requested store IDs.
-
-    A failure while scraping one item is not fatal for the others - it's
-    collected into `errors` and returned alongside whatever did succeed.
-    """
-    rules = [TrackingRule(id=item, query=item, label=item) for item in items]
-    return await get_offers_for_rules(rules, store_ids)
-
-
 async def get_offers_for_rules(
     rules: list[TrackingRule], store_ids: set[str] | None
 ) -> tuple[list[dict], list[str]]:
-    """Fetch offers for the user's broad/exact tracking rules."""
+    """Fetch offers and confidence metadata for the user's smart/exact rules."""
     errors: list[str] = []
 
     async def fetch(rule: TrackingRule) -> list[dict]:
@@ -337,12 +342,21 @@ async def get_offers_for_rules(
             found = await run_in_threadpool(_fetch_one_sync, rule.query)
             results = []
             for offer in found:
-                if not _matches_rule(offer.get("product_name"), rule):
+                match = score_product(
+                    rule.query,
+                    offer.get("product_name"),
+                    match_mode=rule.match_mode,
+                    exact_product_name=rule.exact_product_name or rule.label,
+                    excluded_terms=rule.excluded_terms,
+                    excluded_products=rule.excluded_products,
+                )
+                if match["confidence"] == "none":
                     continue
                 tracked = {
                     "keyword": rule.query,
                     "label": rule.label,
-                    "blacklist": rule.excluded_terms or [],
+                    "excluded_terms": rule.excluded_terms or [],
+                    "excluded_products": rule.excluded_products or [],
                     "temporary": str(rule.id).startswith("tmp-"),
                 }
                 results.append({
@@ -351,7 +365,10 @@ async def get_offers_for_rules(
                     "tracking_rule_id": rule.id,
                     "visual_key": rule.visual_key,
                     "on_sale": True,
-                    "temporary": False,
+                    "temporary": str(rule.id).startswith("tmp-"),
+                    "confidence": match["confidence"],
+                    "match_reason": match["match_reason"],
+                    "suggested_exclusion_term": match["suggested_exclusion_term"],
                 })
             return results
         except Exception as exc:  # kupi.cz layout change, network hiccup, etc.
@@ -381,3 +398,23 @@ async def get_product_suggestions(query: str, limit: int = 12) -> list[str]:
         if len(names) >= limit:
             break
     return names
+
+
+async def get_product_preview(query: str, limit: int = 10) -> list[dict]:
+    """Return the first distinct smart matches for the add-rule preview."""
+    offers = await run_in_threadpool(_fetch_one_sync, query)
+    previews: list[dict] = []
+    seen: set[str] = set()
+    for offer in offers:
+        name = (offer.get("product_name") or "").strip()
+        key = _normalized_text(name)
+        if not name or key in seen:
+            continue
+        seen.add(key)
+        match = score_product(query, name)
+        if match["confidence"] == "none":
+            continue
+        previews.append({"product_name": name, **match})
+        if len(previews) >= limit:
+            break
+    return previews

@@ -7,6 +7,7 @@ export function useOffers(trackedItems: TrackingRule[], selectedStores: string[]
   const [offers, setOffers] = useState<Offer[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [scrapeError, setScrapeError] = useState<string | null>(null);
   const [fetchedAt, setFetchedAt] = useState<string | null>(null);
   // Bumped by refetch() to force the effect below to re-run on demand,
   // e.g. from a manual "refresh" button, without waiting for
@@ -18,6 +19,7 @@ export function useOffers(trackedItems: TrackingRule[], selectedStores: string[]
       setOffers([]);
       setFetchedAt(null);
       setError(null);
+      setScrapeError(null);
       return;
     }
 
@@ -32,12 +34,14 @@ export function useOffers(trackedItems: TrackingRule[], selectedStores: string[]
       setOffers([]);
       setFetchedAt(null);
       setError(null);
+      setScrapeError(null);
       return;
     }
 
     let cancelled = false;
     setLoading(true);
     setError(null);
+    setScrapeError(null);
 
     fetchOffers(trackedItems, selectedStores, includeMissing)
       .then((res) => {
@@ -47,9 +51,9 @@ export function useOffers(trackedItems: TrackingRule[], selectedStores: string[]
         // e.g. "kuřecí maso" can legitimately return "Kuřecí prsní řízky".
         setOffers(res.items);
         setFetchedAt(res.fetched_at);
-        // Partial scrape failures aren't fatal - surface them, but keep
-        // whatever offers did come back.
-        setError(res.errors.length > 0 ? res.errors.join("; ") : null);
+        // The API request succeeded; keep upstream scrape failures separate
+        // from backend connection failures.
+        setScrapeError(res.errors.length > 0 ? res.errors.join("; ") : null);
       })
       .catch((err: Error) => {
         if (!cancelled) setError(err.message);
@@ -71,5 +75,5 @@ export function useOffers(trackedItems: TrackingRule[], selectedStores: string[]
     setRefreshKey((k) => k + 1);
   }
 
-  return { offers, loading, error, fetchedAt, refetch };
+  return { offers, loading, error, scrapeError, fetchedAt, refetch };
 }

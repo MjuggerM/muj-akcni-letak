@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { fetchPreferences } from "../api/client";
 
 const STORAGE_KEY = "muj-akcni-letak:selected-stores";
 
@@ -17,10 +18,34 @@ function loadInitial(): string[] {
 
 export function useStoreFilter() {
   const [selectedStores, setSelectedStores] = useState<string[]>(loadInitial);
+  const [preferencesLoading, setPreferencesLoading] = useState(true);
+  const [preferencesError, setPreferencesError] = useState<string | null>(null);
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(selectedStores));
   }, [selectedStores]);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchPreferences()
+      .then((data) => {
+        if (!cancelled && Array.isArray(data.default_stores)) {
+          const stores = data.default_stores.filter((id): id is string => typeof id === "string");
+          if (stores.length > 0 || selectedStores.length === 0) setSelectedStores(stores);
+        }
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          setPreferencesError(err instanceof Error ? err.message : String(err));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setPreferencesLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   function toggleStore(id: string) {
     setSelectedStores((prev) =>
@@ -28,5 +53,5 @@ export function useStoreFilter() {
     );
   }
 
-  return { selectedStores, toggleStore };
+  return { selectedStores, toggleStore, preferencesLoading, preferencesError };
 }

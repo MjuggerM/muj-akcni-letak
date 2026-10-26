@@ -16,15 +16,3 @@ export function storeColor(storeId: string | null): string {
   return (storeId && STORE_COLORS[storeId]) || FALLBACK_COLOR;
 }
 
-interface StoreIconProps {
-  storeId: string | null;
-}
-
-export function StoreIcon({ storeId }: StoreIconProps) {
-  return (
-    <span
-      className="inline-block h-2 w-2 rounded-full"
-      style={{ backgroundColor: storeColor(storeId) }}
-    />
-  );
-}

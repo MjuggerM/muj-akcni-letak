@@ -1,7 +1,7 @@
 import { Store as StoreIconLucide } from "lucide-react";
 
 import type { Store } from "../types";
-import { storeColor } from "./StoreIcon";
+import { storeColor } from "./storeColors";
 
 interface StoreFilterProps {
   stores: Store[];

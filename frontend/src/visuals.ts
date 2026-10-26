@@ -1,22 +1,21 @@
 export type VisualSource = {
   label: string;
-  remoteQuery: string;
 };
 
 export const VISUAL_SOURCES: Record<string, VisualSource> = {
-  vejce: { label: "Vejce", remoteQuery: "eggs breakfast" },
-  cola: { label: "Cola", remoteQuery: "cola soda can" },
-  kureci: { label: "Kuřecí maso", remoteQuery: "chicken meat" },
-  panenka: { label: "Panenka", remoteQuery: "pork tenderloin" },
-  brambory: { label: "Brambory", remoteQuery: "potatoes" },
-  banany: { label: "Banány", remoteQuery: "bananas fruit" },
-  meloun: { label: "Meloun", remoteQuery: "watermelon fruit" },
-  broskve: { label: "Broskve", remoteQuery: "peaches fruit" },
-  nektarinky: { label: "Nektarinky", remoteQuery: "nectarines fruit" },
-  hrozny: { label: "Hrozny", remoteQuery: "grapes fruit" },
-  ovoce: { label: "Ovoce", remoteQuery: "mixed fruit" },
-  zelenina: { label: "Zelenina", remoteQuery: "fresh vegetables" },
-  paprika: { label: "Paprika", remoteQuery: "bell pepper" },
+  vejce: { label: "Vejce" },
+  cola: { label: "Cola" },
+  kureci: { label: "Kuřecí maso" },
+  panenka: { label: "Panenka" },
+  brambory: { label: "Brambory" },
+  banany: { label: "Banány" },
+  meloun: { label: "Meloun" },
+  broskve: { label: "Broskve" },
+  nektarinky: { label: "Nektarinky" },
+  hrozny: { label: "Hrozny" },
+  ovoce: { label: "Ovoce" },
+  zelenina: { label: "Zelenina" },
+  paprika: { label: "Paprika" },
 };
 
 export function normalizedVisualText(value: string) {
