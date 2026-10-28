@@ -181,9 +181,10 @@ export function OfferGrid({ offers, loading, trackedRuleCount, error, imageLooku
 
   async function undo(entryKey: string) {
     const cached = softExcludedOffers[entryKey];
-    if (!cached?.action || !cached.offer.tracking_rule_id) return;
+    const id = cached?.offer.tracking_rule_id;
+    if (!cached?.action || !id) return;
     const { action, offer } = cached;
-    await onUndoExclude(offer.tracking_rule_id, action.type, action.value);
+    await onUndoExclude(id, action.type, action.value);
 
     setSoftExcludedOffers((current) => {
       const next = { ...current };
