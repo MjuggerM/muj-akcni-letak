@@ -3,6 +3,10 @@ import { useEffect, useState } from "react";
 import { fetchOffers } from "../api/client";
 import type { Offer, TrackingRule } from "../types";
 
+function clearIfNotEmpty(current: Offer[]): Offer[] {
+  return current.length === 0 ? current : [];
+}
+
 export function useOffers(trackedItems: TrackingRule[], selectedStores: string[], includeMissing = false) {
   const [offers, setOffers] = useState<Offer[]>([]);
   const [loading, setLoading] = useState(false);
@@ -16,10 +20,11 @@ export function useOffers(trackedItems: TrackingRule[], selectedStores: string[]
 
   useEffect(() => {
     if (trackedItems.length === 0) {
-      setOffers([]);
+      setOffers(clearIfNotEmpty);
       setFetchedAt(null);
       setError(null);
       setScrapeError(null);
+      setLoading(false);
       return;
     }
 
@@ -31,10 +36,11 @@ export function useOffers(trackedItems: TrackingRule[], selectedStores: string[]
     // wasted scrape of every tracked item for stores nobody asked for.
     // Treat it the same as "nothing to show" instead.
     if (selectedStores.length === 0) {
-      setOffers([]);
+      setOffers(clearIfNotEmpty);
       setFetchedAt(null);
       setError(null);
       setScrapeError(null);
+      setLoading(false);
       return;
     }
 

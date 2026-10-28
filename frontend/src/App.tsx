@@ -9,7 +9,10 @@ import { useImageLookupMode } from "./hooks/useImageLookupMode";
 import { useOffers } from "./hooks/useOffers";
 import { useStoreFilter } from "./hooks/useStoreFilter";
 import { useTrackedItems } from "./hooks/useTrackedItems";
-import type { Store } from "./types";
+import type { Store, TrackingRule } from "./types";
+
+// Keep the paused request's empty rules array stable across renders.
+const NO_RULES: TrackingRule[] = [];
 
 export default function App() {
   const [stores, setStores] = useState<Store[]>([]);
@@ -37,8 +40,9 @@ export default function App() {
   const [imageLookupMode, setImageLookupMode] = useImageLookupMode();
 
   const combinedRules = useMemo(() => [...trackedItems, ...sessionItems], [trackedItems, sessionItems]);
+  const ruleOrder = useMemo(() => combinedRules.map((rule) => rule.id), [combinedRules]);
   const { offers, loading, error: offersError, scrapeError, fetchedAt, refetch } = useOffers(
-    preferencesLoading || storesLoading ? [] : combinedRules,
+    preferencesLoading || storesLoading ? NO_RULES : combinedRules,
     selectedStores,
     showNotOnSale,
   );
@@ -155,7 +159,8 @@ export default function App() {
 
             <OfferGrid
               offers={offers}
-              loading={loading}
+              ruleOrder={ruleOrder}
+              loading={loading || preferencesLoading || storesLoading}
               trackedRuleCount={combinedRules.length}
               error={visibleError ?? scrapeError}
               imageLookupMode={imageLookupMode}

@@ -7,6 +7,7 @@ import type { ExclusionAction } from "./ProductCard";
 
 interface OfferGridProps {
   offers: Offer[];
+  ruleOrder: string[];
   loading: boolean;
   trackedRuleCount: number;
   error: string | null;
@@ -30,6 +31,7 @@ interface OfferEntry {
 
 interface OfferGroup {
   key: string;
+  ruleId: string;
   ruleLabel: string;
   unit: string | null;
   entries: OfferEntry[];
@@ -73,7 +75,7 @@ function actionAffectsOffer(offer: Offer, action: ExclusionAction) {
     || normalize(offer.suggested_exclusion_term) === normalize(action.value);
 }
 
-function buildGroups(offers: Offer[]): OfferGroup[] {
+function buildGroups(offers: Offer[], ruleOrder: string[]): OfferGroup[] {
   const groups = new Map<string, OfferGroup>();
   const shopSets = new Map<string, Set<string>>();
 
@@ -81,7 +83,7 @@ function buildGroups(offers: Offer[]): OfferGroup[] {
     const label = trackedLabel(offer);
     const id = ruleId(offer);
     const key = JSON.stringify([id, offer.unit]);
-    if (!groups.has(key)) groups.set(key, { key, ruleLabel: label, unit: offer.unit, entries: [] });
+    if (!groups.has(key)) groups.set(key, { key, ruleId: id, ruleLabel: label, unit: offer.unit, entries: [] });
 
     if (offer.on_sale !== false && offer.unit && offer.unit_price !== null) {
       const shops = shopSets.get(key) ?? new Set<string>();
@@ -115,7 +117,12 @@ function buildGroups(offers: Offer[]): OfferGroup[] {
       return (a.offer.product_name ?? "").localeCompare(b.offer.product_name ?? "", "cs-CZ");
     });
   }
-  return [...groups.values()];
+  const ranks = new Map(ruleOrder.map((id, index) => [id, index]));
+  return [...groups.values()].sort((a, b) => {
+    const rankDifference = (ranks.get(a.ruleId) ?? ruleOrder.length) - (ranks.get(b.ruleId) ?? ruleOrder.length);
+    if (rankDifference !== 0) return rankDifference;
+    return (a.unit ?? "").localeCompare(b.unit ?? "");
+  });
 }
 
 function unitHeading(unit: string | null) {
@@ -139,7 +146,7 @@ function LoadingCards() {
   );
 }
 
-export function OfferGrid({ offers, loading, trackedRuleCount, error, imageLookupMode, onExclude, onUndoExclude }: OfferGridProps) {
+export function OfferGrid({ offers, ruleOrder, loading, trackedRuleCount, error, imageLookupMode, onExclude, onUndoExclude }: OfferGridProps) {
   const [softExcludedOffers, setSoftExcludedOffers] = useState<Record<string, SoftExcludedOffer>>({});
 
   useEffect(() => {
@@ -162,7 +169,7 @@ export function OfferGrid({ offers, loading, trackedRuleCount, error, imageLooku
   for (const [key, cached] of Object.entries(softExcludedOffers)) {
     if (!offersByKey.has(key)) offersByKey.set(key, cached.offer);
   }
-  const groups = buildGroups([...offersByKey.values()]);
+  const groups = buildGroups([...offersByKey.values()], ruleOrder);
   const entries = groups.flatMap((group) => group.entries);
 
   async function exclude(entry: OfferEntry, action: ExclusionAction) {
@@ -200,7 +207,7 @@ export function OfferGrid({ offers, loading, trackedRuleCount, error, imageLooku
     });
   }
 
-  if (groups.length === 0 && loading && trackedRuleCount > 0) return <LoadingCards />;
+  if (groups.length === 0 && loading) return <LoadingCards />;
   if (groups.length === 0) {
     const emptyMessage = trackedRuleCount === 0
       ? "Zatím nic nesleduješ. Přidej položku v nastavení nebo použij dočasné hledání."
