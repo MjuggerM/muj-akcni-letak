@@ -173,10 +173,8 @@ export function ProductCard({
         <ProductVisual
           imageUrl={offer.image_url}
           tag={ruleLabel}
-          visualKey={offer.visual_key}
           productName={offer.product_name}
           imageLookupMode={imageLookupMode}
-          size="full"
         />
 
         {bestDeal && !excluded && (

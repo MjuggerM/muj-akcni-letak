@@ -19,7 +19,6 @@ class TrackingRule(BaseModel):
     exact_product_name: str | None = None
     excluded_terms: list[str] = Field(default_factory=list)
     excluded_products: list[str] = Field(default_factory=list)
-    visual_key: str | None = None
 
     @field_validator("match_mode", mode="before")
     @classmethod
@@ -85,7 +84,6 @@ class Offer(BaseModel):
     on_sale: bool = True
     temporary: bool = False
     tracking_rule_id: str | None = None
-    visual_key: str | None = None
     image_url: str | None = None
     unit_price: float | None = None
     unit: str | None = None

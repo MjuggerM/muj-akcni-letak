@@ -149,7 +149,6 @@ export default function App() {
                       exact_product_name: null,
                       excluded_terms: [],
                       excluded_products: [],
-                      visual_key: null,
                     },
                   ])
                 }

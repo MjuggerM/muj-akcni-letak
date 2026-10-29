@@ -13,6 +13,13 @@ from app.product_matching import score_product
 from app.schemas import PreferencesUpdate, RuleExclusionUpdate, TrackedItem, TrackingRule
 
 
+def test_rule_ignores_removed_visual_key_field():
+    rule = TrackingRule.model_validate({"id": "x", "query": "a", "label": "a", "visual_key": "vejce"})
+
+    assert rule.query == "a"
+    assert "visual_key" not in rule.model_dump()
+
+
 def test_flatten_keeps_the_fields_from_the_same_shop_index():
     raw = json.dumps(
         [

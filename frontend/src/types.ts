@@ -15,7 +15,6 @@ export interface TrackingRule {
   exact_product_name: string | null;
   excluded_terms: string[];
   excluded_products: string[];
-  visual_key: string | null;
 }
 
 // Mirrors backend/app/schemas.py::TrackedItem.
@@ -36,7 +35,6 @@ export interface Offer {
   validity: string | null;
   tracked_item: TrackedItem | string;
   tracking_rule_id: string | null;
-  visual_key: string | null;
   image_url: string | null;
   unit_price: number | null;
   unit: string | null;

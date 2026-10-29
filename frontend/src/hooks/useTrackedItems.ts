@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import type { TrackingRule } from "../types";
 import { addRuleExclusion, fetchPreferences, removeRuleExclusion } from "../api/client";
-import { findVisualKey } from "../visuals";
 
 const STORAGE_KEY = "muj-akcni-letak:tracked-items";
 export const MAX_TRACKED_ITEMS = 50;
@@ -24,7 +23,6 @@ function createBroadRule(query: string, excludedTerms: string[] = [], excludedPr
     exact_product_name: null,
     excluded_terms: excludedTerms,
     excluded_products: excludedProducts,
-    visual_key: findVisualKey(trimmed),
   };
 }
 
@@ -52,7 +50,6 @@ function loadInitial(): TrackingRule[] {
         exact_product_name: rule.exact_product_name ?? null,
         excluded_terms: [...new Set(excludedTerms)],
         excluded_products: Array.isArray(rule.excluded_products) ? rule.excluded_products.filter((name): name is string => typeof name === "string") : [],
-        visual_key: rule.visual_key ?? findVisualKey(rule.query),
       }];
     });
   } catch {
@@ -137,7 +134,6 @@ export function useTrackedItems() {
       exact_product_name: productName,
       excluded_terms: [],
       excluded_products: [],
-      visual_key: findVisualKey(query),
     };
     if (!canAdd(rule)) return false;
     setTrackedItems((prev) => [...prev, rule]);

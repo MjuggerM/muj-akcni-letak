@@ -261,7 +261,6 @@ async def offers(
                                 "temporary": False,
                             },
                             "tracking_rule_id": rule.id,
-                            "visual_key": rule.visual_key,
                             "on_sale": False,
                             "temporary": False,
                         }
